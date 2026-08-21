@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<title>Avatar Studio</title>
+<link rel="stylesheet" href="styles.css" />
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body>
+
+  <div class="app-shell">
+
+    <aside class="rail">
+      <div class="rail-mark">AS</div>
+      <nav class="rail-nav">
+        <button class="rail-item is-active" data-view="avatar">
+          <span class="rail-num">01</span>
+          <span class="rail-label">Аватар</span>
+        </button>
+        <button class="rail-item" data-view="voice">
+          <span class="rail-num">02</span>
+          <span class="rail-label">Голос</span>
+        </button>
+        <button class="rail-item" data-view="cut">
+          <span class="rail-num">03</span>
+          <span class="rail-label">Монтаж</span>
+        </button>
+      </nav>
+      <div class="rail-status" id="backend-status">
+        <span class="status-dot"></span>
+        <span class="status-text">подключение…</span>
+      </div>
+    </aside>
+
+    <main class="stage">
+
+      <!-- ЭКРАН 1: АВАТАР -->
+      <section class="view is-active" data-view="avatar">
+        <header class="view-head">
+          <p class="view-eyebrow">Шаг первый</p>
+          <h1>Создайте свой аватар</h1>
+          <p class="view-sub">Загрузите чёткую фотографию или короткое видео лица. Это станет неизменной основой для всех будущих сцен — чем стабильнее опора, тем стабильнее результат.</p>
+        </header>
+
+        <div class="panel-grid">
+          <div class="panel dropzone" id="avatar-dropzone">
+            <div class="dropzone-inner">
+              <i class="dz-icon">◐</i>
+              <p class="dz-title">Перетащите фото или видео</p>
+              <p class="dz-sub">JPG, PNG или MP4 — лицо анфас, ровный свет</p>
+              <button class="btn btn-ghost" id="avatar-browse">Выбрать файл</button>
+            </div>
+          </div>
+
+          <div class="panel form-panel">
+            <label class="field">
+              <span class="field-label">Имя аватара</span>
+              <input type="text" id="avatar-name" placeholder="Например, «Вадим — деловой»" />
+            </label>
+
+            <label class="consent">
+              <input type="checkbox" id="avatar-consent" />
+              <span>Это моё лицо, либо у меня есть право использовать эти данные для создания аватара</span>
+            </label>
+
+            <button class="btn btn-primary" id="avatar-submit" disabled>Создать аватар</button>
+            <p class="field-hint" id="avatar-result"></p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ЭКРАН 2: ГОЛОС -->
+      <section class="view" data-view="voice">
+        <header class="view-head">
+          <p class="view-eyebrow">Шаг второй</p>
+          <h1>Клонируйте голос</h1>
+          <p class="view-sub">15–20 секунд чистой речи без музыки и шума на фоне — этого достаточно для устойчивого клонирования тембра.</p>
+        </header>
+
+        <div class="panel-grid">
+          <div class="panel dropzone" id="voice-dropzone">
+            <div class="dropzone-inner">
+              <i class="dz-icon">◑</i>
+              <p class="dz-title">Перетащите аудио</p>
+              <p class="dz-sub">WAV или MP3, минимум 6 секунд речи</p>
+              <button class="btn btn-ghost" id="voice-browse">Выбрать файл</button>
+            </div>
+          </div>
+
+          <div class="panel form-panel">
+            <label class="field">
+              <span class="field-label">Название голоса</span>
+              <input type="text" id="voice-name" placeholder="Например, «Мой голос»" />
+            </label>
+
+            <label class="consent">
+              <input type="checkbox" id="voice-consent" />
+              <span>Это мой голос, либо у меня есть право его клонировать</span>
+            </label>
+
+            <button class="btn btn-primary" id="voice-submit" disabled>Клонировать голос</button>
+            <p class="field-hint" id="voice-result"></p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ЭКРАН 3: МОНТАЖ -->
+      <section class="view" data-view="cut">
+        <header class="view-head">
+          <p class="view-eyebrow">Шаг третий</p>
+          <h1>Соберите фильм</h1>
+          <p class="view-sub">Каждый сегмент — до 5 минут. Добавляйте сегменты один за другим, они лягут на плёнку в том порядке, в котором вы их создаёте.</p>
+        </header>
+
+        <div class="panel segment-form">
+          <label class="field field-grow">
+            <span class="field-label">Текст сегмента</span>
+            <textarea id="segment-text" rows="3" placeholder="Текст, который произнесёт аватар в этом сегменте…"></textarea>
+          </label>
+          <button class="btn btn-primary" id="segment-add">Добавить сегмент</button>
+        </div>
+
+        <div class="filmstrip-wrap">
+          <div class="filmstrip" id="filmstrip">
+            <div class="filmstrip-empty" id="filmstrip-empty">
+              Плёнка пуста — добавьте первый сегмент выше
+            </div>
+          </div>
+        </div>
+
+        <div class="cut-footer">
+          <div class="cut-total">
+            <span class="cut-total-label">Итоговая длительность</span>
+            <span class="cut-total-value" id="cut-total">0:00</span>
+          </div>
+          <button class="btn btn-accent" id="cut-render" disabled>Собрать фильм</button>
+        </div>
+      </section>
+
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

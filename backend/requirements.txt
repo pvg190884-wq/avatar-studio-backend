@@ -1,0 +1,30 @@
+# Avatar Studio — backend requirements
+# Ставится на машине с NVIDIA GPU (8ГБ+ VRAM рекомендуется).
+# pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121
+
+# --- Оркестрация ---
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
+pydantic==2.9.2
+sqlalchemy==2.0.35
+aiosqlite==0.20.0
+
+# --- Видео/аудио утилиты ---
+ffmpeg-python==0.2.0
+opencv-python==4.10.0.84
+numpy==1.26.4
+soundfile==0.12.1
+librosa==0.10.2
+
+# --- ML рантайм (веса моделей НЕ входят в requirements — качаются отдельно) ---
+torch==2.4.1
+torchvision==0.19.1
+torchaudio==2.4.1
+onnxruntime-gpu==1.19.2
+
+# --- Модели пайплайна (устанавливаются как git-репозитории, см. README) ---
+# Клонирование голоса:  coqui-tts (XTTS-v2)      -> pip install coqui-tts
+# Идентичность лица:    insightface               -> pip install insightface
+# Липсинк:              MuseTalk / Wav2Lik-HQ     -> см. README, ставится из исходников
+# Восстановление лица:  codeformer                -> см. README
