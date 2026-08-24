@@ -27,31 +27,25 @@ HEADERS = {
 }
 
 
-def _poll_and_save(job_id: str, poll_interval: int = 10, max_wait_seconds: int = 1800) -> str:
-    status_url = f"{RUNPOD_BASE_URL}/status/{job_id}"
-    waited = 0
-    while waited < max_wait_seconds:
-        time.sleep(poll_interval)
-        waited += poll_interval
-        status_resp = requests.get(status_url, headers=HEADERS, timeout=30)
-        data = status_resp.json()
-        status = data.get("status")
-
-        if status == "COMPLETED":
-            video_b64 = data["output"]["video_base64"]
-            out_path = os.path.join(OUTPUT_DIR, f"{job_id}.mp4")
-            with open(out_path, "wb") as f:
-                f.write(base64.b64decode(video_b64))
-            return out_path
-        elif status == "FAILED":
-            raise HTTPException(status_code=502, detail=f"Генерация упала: {data}")
-
-    raise HTTPException(status_code=504, detail="Превышено время ожидания генерации")
+# ---------------------------------------------------------------------------
+# Важно: эндпоинты FastAPI ниже НЕ ждут завершения генерации внутри одного
+# HTTP-запроса. Railway (edge-прокси перед приложением) обрывает долгие
+# запросы своим собственным таймаутом независимо от кода приложения —
+# генерация видео (SadTalker + XTTS-v2) может занимать 5+ минут, что
+# превышает этот лимит. Поэтому используется схема submit → poll:
+#   1) POST /photo-text-emotion (или /photo-emotion) сразу отправляет
+#      задачу в RunPod и возвращает job_id — сам HTTP-запрос занимает
+#      секунды.
+#   2) Клиент (или тестировщик через Swagger/curl) опрашивает
+#      GET /status/{job_id} с любым интервалом, пока не получит готовое
+#      видео — каждый такой запрос тоже быстрый, так что Railway его не
+#      обрывает.
+# ---------------------------------------------------------------------------
 
 
-def run_sadtalker_job(image_path: str, audio_path: str, expression_scale: float,
-                        pose_style: int, size: int = 512, still: bool = True,
-                        enhancer: str = "gfpgan") -> str:
+def submit_sadtalker_job(image_path: str, audio_path: str, expression_scale: float,
+                          pose_style: int, size: int = 512, still: bool = True,
+                          enhancer: str = "gfpgan") -> str:
     with open(image_path, "rb") as f:
         img_b64 = base64.b64encode(f.read()).decode("utf-8")
     with open(audio_path, "rb") as f:
@@ -76,11 +70,11 @@ def run_sadtalker_job(image_path: str, audio_path: str, expression_scale: float,
     if not job_id:
         raise HTTPException(status_code=502, detail=f"RunPod не вернул id задачи: {job}")
 
-    return _poll_and_save(job_id)
+    return job_id
 
 
-def run_photo_text_emotion_job(image_path: str, voice_sample_path: str, text: str,
-                                 emotion: str, language: str = "ru") -> str:
+def submit_photo_text_emotion_job(image_path: str, voice_sample_path: str, text: str,
+                                   emotion: str, language: str = "ru") -> str:
     with open(image_path, "rb") as f:
         img_b64 = base64.b64encode(f.read()).decode("utf-8")
     with open(voice_sample_path, "rb") as f:
@@ -103,7 +97,7 @@ def run_photo_text_emotion_job(image_path: str, voice_sample_path: str, text: st
     if not job_id:
         raise HTTPException(status_code=502, detail=f"RunPod не вернул id задачи: {job}")
 
-    return _poll_and_save(job_id)
+    return job_id
 
 
 @router.post("/photo-emotion")
@@ -113,7 +107,8 @@ async def generate_photo_emotion(
     expression_scale: float = Form(0.7),
     pose_style: int = Form(0)
 ):
-    """Кейс 2: фото + аудио, модель сама подстраивает эмоции под голос."""
+    """Кейс 2: фото + аудио, модель сама подстраивает эмоции под голос.
+    Сразу возвращает job_id — результат забирается через GET /status/{job_id}."""
     request_id = uuid.uuid4().hex
     image_path = os.path.join(TEMP_DIR, f"{request_id}_{image.filename}")
     audio_path = os.path.join(TEMP_DIR, f"{request_id}_{audio.filename}")
@@ -124,7 +119,7 @@ async def generate_photo_emotion(
         f.write(await audio.read())
 
     try:
-        output_path = run_sadtalker_job(
+        job_id = submit_sadtalker_job(
             image_path, audio_path,
             expression_scale=expression_scale,
             pose_style=pose_style
@@ -134,7 +129,7 @@ async def generate_photo_emotion(
             if os.path.exists(p):
                 os.remove(p)
 
-    return FileResponse(output_path, media_type="video/mp4", filename="avatar_result.mp4")
+    return {"job_id": job_id, "status_url": f"/api/generate/status/{job_id}"}
 
 
 @router.post("/photo-text-emotion")
@@ -145,7 +140,8 @@ async def generate_photo_text_emotion(
     emotion: str = Form("neutral"),
     language: str = Form("ru")
 ):
-    """Кейс 1: фото + образец голоса + текст + выбор эмоции."""
+    """Кейс 1: фото + образец голоса + текст + выбор эмоции.
+    Сразу возвращает job_id — результат забирается через GET /status/{job_id}."""
     request_id = uuid.uuid4().hex
     image_path = os.path.join(TEMP_DIR, f"{request_id}_{image.filename}")
     voice_path = os.path.join(TEMP_DIR, f"{request_id}_{voice_sample.filename}")
@@ -156,7 +152,7 @@ async def generate_photo_text_emotion(
         f.write(await voice_sample.read())
 
     try:
-        output_path = run_photo_text_emotion_job(
+        job_id = submit_photo_text_emotion_job(
             image_path, voice_path, text, emotion, language
         )
     finally:
@@ -164,4 +160,28 @@ async def generate_photo_text_emotion(
             if os.path.exists(p):
                 os.remove(p)
 
-    return FileResponse(output_path, media_type="video/mp4", filename="avatar_result.mp4")
+    return {"job_id": job_id, "status_url": f"/api/generate/status/{job_id}"}
+
+
+@router.get("/status/{job_id}")
+async def get_job_status(job_id: str):
+    """Опрашивается клиентом (или вручную через Swagger/curl) до тех пор,
+    пока генерация не завершится. Быстрый запрос — не подвержен таймауту
+    Railway edge-прокси, в отличие от прямого ожидания результата."""
+    status_url = f"{RUNPOD_BASE_URL}/status/{job_id}"
+    status_resp = requests.get(status_url, headers=HEADERS, timeout=30)
+    data = status_resp.json()
+    status = data.get("status")
+
+    if status == "COMPLETED":
+        video_b64 = data["output"]["video_base64"]
+        out_path = os.path.join(OUTPUT_DIR, f"{job_id}.mp4")
+        with open(out_path, "wb") as f:
+            f.write(base64.b64decode(video_b64))
+        return FileResponse(out_path, media_type="video/mp4", filename="avatar_result.mp4")
+
+    if status == "FAILED":
+        raise HTTPException(status_code=502, detail=f"Генерация упала: {data}")
+
+    # IN_QUEUE / IN_PROGRESS и т.п. — сообщаем клиенту, что нужно спросить позже
+    return {"job_id": job_id, "status": status}
