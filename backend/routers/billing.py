@@ -24,6 +24,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from database import get_db, User, Deposit, init_db
+from auth_utils import get_current_user_id
 
 CRYPTO_PAY_TOKEN = os.getenv("CRYPTO_PAY_TOKEN")
 CRYPTO_PAY_BASE_URL = "https://pay.crypt.bot/api"
@@ -60,7 +61,6 @@ ACCEPTED_ASSETS_FOR_FIAT = "USDT,TON,BTC"
 
 
 class CreateInvoiceRequest(BaseModel):
-    user_id: str
     amount: float
     method: str  # "RUB", "USD", "BTC", "TON", "USDT"
 
@@ -70,7 +70,6 @@ class InvoiceStatusRequest(BaseModel):
 
 
 class SbpRequestBody(BaseModel):
-    user_id: str
     amount_rub: float
 
 
@@ -152,17 +151,21 @@ def calculate_generation_cost(duration_seconds: float) -> float:
 
 
 @router.post("/create-deposit")
-async def create_deposit(req: CreateInvoiceRequest, db: Session = Depends(get_db)):
+async def create_deposit(
+    req: CreateInvoiceRequest,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
     """Крипто-путь (RUB/USD/BTC/TON/USDT через Crypto Pay)."""
-    get_or_create_user(db, req.user_id)
+    get_or_create_user(db, user_id)
     invoice = create_crypto_pay_invoice(
         amount=req.amount,
         method=req.method,
-        description=f"Пополнение баланса Avatar Studio (user {req.user_id})",
+        description=f"Пополнение баланса Avatar Studio (user {user_id})",
     )
 
     deposit = Deposit(
-        user_id=req.user_id,
+        user_id=user_id,
         method=req.method.upper(),
         amount=req.amount,
         status="pending",
@@ -216,15 +219,19 @@ async def check_deposit(req: InvoiceStatusRequest, db: Session = Depends(get_db)
 
 
 @router.post("/sbp/request")
-async def sbp_request(req: SbpRequestBody, db: Session = Depends(get_db)):
+async def sbp_request(
+    req: SbpRequestBody,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
     """Клиент выбрал способ оплаты СБП -> создаётся заявка 'pending' ->
     фронтенд показывает номер телефона (SBP_PHONE) и просит после
     перевода прислать номер операции. Зачисление — только после ручного
     подтверждения через /sbp/confirm."""
-    get_or_create_user(db, req.user_id)
+    get_or_create_user(db, user_id)
 
     deposit = Deposit(
-        user_id=req.user_id,
+        user_id=user_id,
         method="SBP",
         amount=req.amount_rub,
         status="pending",
@@ -275,8 +282,8 @@ async def sbp_confirm(req: SbpConfirmBody, db: Session = Depends(get_db)):
 
 
 @router.get("/balance")
-async def get_balance(user_id: str, db: Session = Depends(get_db)):
-    """Текущий баланс пользователя в USD — для отображения в приложении."""
+async def get_balance(db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
+    """Текущий баланс авторизованного пользователя в USD."""
     user = get_or_create_user(db, user_id)
     return {"user_id": user_id, "balance_usd": round(user.balance_usd, 4)}
 
