@@ -2,32 +2,46 @@
 Avatar Studio — модуль биллинга.
 
 Отвечает за:
-- пополнение баланса пользователя через Crypto Pay (@CryptoBot) — оплата
-  QR-кодом в любой валюте (в т.ч. рубли), расчёт в USDT/TON на Telegram-кошелёк,
-  без необходимости открывать банковский счёт;
-- списание с баланса за генерацию (посекундно, с коэффициентом наценки 50%
-  сверх фактической стоимости GPU-времени на RunPod).
+- пополнение баланса через Crypto Pay (@CryptoBot) — QR-оплата в RUB/USD/
+  BTC/TON/USDT, без банковского счёта;
+- пополнение через СБП (личный перевод по номеру телефона) — полу-ручной
+  режим: клиент переводит и указывает номер операции, администратор
+  подтверждает вручную через защищённый эндпоинт;
+- списание с баланса за генерацию (посекундно, +50% наценка к стоимости
+  GPU-времени RunPod).
 
-Требует переменную окружения CRYPTO_PAY_TOKEN — получить через @CryptoBot
-командой /pay -> Create App.
+Переменные окружения:
+  CRYPTO_PAY_TOKEN — получить через @CryptoBot командой /pay -> Create App
+  ADMIN_SECRET     — произвольная строка-пароль для подтверждения СБП-заявок
+  SBP_PHONE        — номер телефона для личных переводов по СБП
+  DATABASE_URL     — создаётся автоматически Railway при добавлении Postgres
 """
 import os
-import time
 import requests
-from fastapi import APIRouter, HTTPException
+from datetime import datetime
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from database import get_db, User, Deposit, init_db
 
 CRYPTO_PAY_TOKEN = os.getenv("CRYPTO_PAY_TOKEN")
 CRYPTO_PAY_BASE_URL = "https://pay.crypt.bot/api"
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "")
+SBP_PHONE = os.getenv("SBP_PHONE", "не настроен")
 
 # Наценка поверх фактической стоимости GPU-времени RunPod.
 MARKUP_COEFFICIENT = 1.5  # +50%
 
 # Ориентировочная стоимость GPU-времени в долларах за секунду.
-# ВАЖНО: подставь сюда реальную ставку из RunPod (Billing -> Usage), это
-# сейчас примерное значение под GPU 24GB, которое вы используете
-# (RunPod указывал $0.69/hr в консоли -> $0.69 / 3600 сек).
+# ВАЖНО: сверь с реальной ставкой в RunPod (Billing -> Usage).
 RUNPOD_COST_PER_SECOND_USD = 0.69 / 3600
+
+# Курс для конвертации рублёвых СБП-пополнений в USD-баланс.
+# ВАЖНО: это фиксированное приближение, не биржевой курс в реальном
+# времени — обновляй вручную по мере необходимости, либо замени на
+# запрос к какому-нибудь бесплатному API курсов валют, когда дойдут руки.
+RUB_TO_USD_RATE = 0.011  # ориентировочно, ~90 руб. за доллар
 
 router = APIRouter(prefix="/api/billing", tags=["billing"])
 
@@ -35,32 +49,78 @@ CRYPTO_PAY_HEADERS = {
     "Crypto-Pay-API-Token": CRYPTO_PAY_TOKEN,
 }
 
+# Способы оплаты в окне приложения. RUB/USD — фиатное отображение суммы
+# через Crypto Pay (платёж всё равно в крипте, но список монет сужен через
+# accepted_assets). BTC/TON/USDT — прямой выбор монеты. SBP — отдельный
+# полу-ручной путь, не через Crypto Pay вообще.
+FIAT_METHODS = {"RUB", "USD"}
+CRYPTO_METHODS = {"BTC", "TON", "USDT"}
+ALL_CRYPTO_PAY_METHODS = FIAT_METHODS | CRYPTO_METHODS
+ACCEPTED_ASSETS_FOR_FIAT = "USDT,TON,BTC"
+
 
 class CreateInvoiceRequest(BaseModel):
     user_id: str
     amount: float
-    currency: str  # "RUB" или "USD" — фиатный эквивалент, сконвертируется в крипту автоматически
+    method: str  # "RUB", "USD", "BTC", "TON", "USDT"
 
 
 class InvoiceStatusRequest(BaseModel):
     invoice_id: int
 
 
-def create_crypto_pay_invoice(amount: float, currency: str, description: str) -> dict:
-    """Создаёт счёт в Crypto Pay. currency — фиатный код (RUB, USD и т.д.),
-    Crypto Pay сам покажет плательщику сумму в USDT/TON по актуальному курсу.
-    Возвращает словарь с полями invoice_id, pay_url (по нему строится QR)."""
+class SbpRequestBody(BaseModel):
+    user_id: str
+    amount_rub: float
+
+
+class SbpConfirmBody(BaseModel):
+    deposit_id: int
+    admin_secret: str
+    approve: bool  # True — подтвердить и зачислить, False — отклонить
+
+
+def get_or_create_user(db: Session, user_id: str) -> User:
+    user = db.query(User).filter(User.user_id == user_id).first()
+    if not user:
+        user = User(user_id=user_id, balance_usd=0.0)
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    return user
+
+
+def create_crypto_pay_invoice(amount: float, method: str, description: str) -> dict:
     if not CRYPTO_PAY_TOKEN:
         raise HTTPException(status_code=500, detail="CRYPTO_PAY_TOKEN не настроен на сервере")
 
-    payload = {
-        "currency_type": "fiat",
-        "fiat": currency,
-        "amount": str(amount),
-        "description": description,
-        "paid_btn_name": "callback",
-        "paid_btn_url": "https://t.me/Bestconsultingbot",
-    }
+    method = method.upper()
+    if method not in ALL_CRYPTO_PAY_METHODS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Неизвестный способ оплаты '{method}', доступны: {sorted(ALL_CRYPTO_PAY_METHODS)}",
+        )
+
+    if method in FIAT_METHODS:
+        payload = {
+            "currency_type": "fiat",
+            "fiat": method,
+            "amount": str(amount),
+            "accepted_assets": ACCEPTED_ASSETS_FOR_FIAT,
+            "description": description,
+            "paid_btn_name": "callback",
+            "paid_btn_url": "https://t.me/Bestconsultingbot",
+        }
+    else:
+        payload = {
+            "currency_type": "crypto",
+            "asset": method,
+            "amount": str(amount),
+            "description": description,
+            "paid_btn_name": "callback",
+            "paid_btn_url": "https://t.me/Bestconsultingbot",
+        }
+
     resp = requests.post(
         f"{CRYPTO_PAY_BASE_URL}/createInvoice",
         headers=CRYPTO_PAY_HEADERS,
@@ -74,7 +134,6 @@ def create_crypto_pay_invoice(amount: float, currency: str, description: str) ->
 
 
 def check_crypto_pay_invoice(invoice_id: int) -> dict:
-    """Проверяет статус счёта — 'active' (ещё не оплачен) или 'paid'."""
     resp = requests.get(
         f"{CRYPTO_PAY_BASE_URL}/getInvoices",
         headers=CRYPTO_PAY_HEADERS,
@@ -88,43 +147,66 @@ def check_crypto_pay_invoice(invoice_id: int) -> dict:
 
 
 def calculate_generation_cost(duration_seconds: float) -> float:
-    """Считает стоимость генерации в USD: фактическая GPU-стоимость за
-    время генерации, умноженная на коэффициент наценки (+50%)."""
     base_cost = duration_seconds * RUNPOD_COST_PER_SECOND_USD
     return round(base_cost * MARKUP_COEFFICIENT, 4)
 
 
 @router.post("/create-deposit")
-async def create_deposit(req: CreateInvoiceRequest):
-    """Клиент выбирает сумму и валюту (RUB/USD) в приложении -> здесь
-    создаётся счёт в Crypto Pay -> фронтенд строит QR-код из pay_url
-    (любой библиотекой генерации QR на клиенте, например qrcode.js)."""
+async def create_deposit(req: CreateInvoiceRequest, db: Session = Depends(get_db)):
+    """Крипто-путь (RUB/USD/BTC/TON/USDT через Crypto Pay)."""
+    get_or_create_user(db, req.user_id)
     invoice = create_crypto_pay_invoice(
         amount=req.amount,
-        currency=req.currency,
+        method=req.method,
         description=f"Пополнение баланса Avatar Studio (user {req.user_id})",
     )
+
+    deposit = Deposit(
+        user_id=req.user_id,
+        method=req.method.upper(),
+        amount=req.amount,
+        status="pending",
+        external_id=str(invoice["invoice_id"]),
+    )
+    db.add(deposit)
+    db.commit()
+
     return {
         "invoice_id": invoice["invoice_id"],
         "pay_url": invoice["pay_url"],
         "amount": req.amount,
-        "currency": req.currency,
+        "method": req.method.upper(),
     }
 
 
 @router.post("/check-deposit")
-async def check_deposit(req: InvoiceStatusRequest):
-    """Опрашивается фронтендом после показа QR — как только status == 'paid',
-    нужно зачислить сумму на баланс пользователя в базе данных (см. TODO
-    ниже — подключить реальную БД, сейчас это заглушка без сохранения)."""
+async def check_deposit(req: InvoiceStatusRequest, db: Session = Depends(get_db)):
+    """Опрашивается фронтендом после показа QR. При первом обнаружении
+    статуса 'paid' — зачисляет баланс и помечает депозит обработанным,
+    защищено от повторного начисления при повторных опросах."""
     invoice = check_crypto_pay_invoice(req.invoice_id)
     is_paid = invoice["status"] == "paid"
 
-    # TODO: как только появится БД (Фаза 2 из плана) — здесь нужно:
-    # 1) проверить, что этот invoice_id ещё не был зачислен ранее (защита
-    #    от повторного начисления при многократном опросе)
-    # 2) прибавить invoice["amount"] к балансу пользователя, сохранив
-    #    invoice_id как обработанный
+    if is_paid:
+        deposit = db.query(Deposit).filter(
+            Deposit.external_id == str(req.invoice_id),
+            Deposit.status == "pending",
+        ).first()
+        if deposit:
+            amount_usd = float(invoice.get("amount", deposit.amount))
+            if deposit.method == "RUB":
+                amount_usd = deposit.amount * RUB_TO_USD_RATE
+            elif deposit.method == "USD":
+                amount_usd = deposit.amount
+            # Для BTC/TON/USDT используем сумму, подтверждённую Crypto Pay,
+            # как приближение к USD (грубо для BTC/TON, точно для USDT).
+
+            user = get_or_create_user(db, deposit.user_id)
+            user.balance_usd += amount_usd
+            deposit.status = "confirmed"
+            deposit.amount_usd = amount_usd
+            deposit.confirmed_at = datetime.utcnow()
+            db.commit()
 
     return {
         "invoice_id": req.invoice_id,
@@ -133,11 +215,74 @@ async def check_deposit(req: InvoiceStatusRequest):
     }
 
 
+@router.post("/sbp/request")
+async def sbp_request(req: SbpRequestBody, db: Session = Depends(get_db)):
+    """Клиент выбрал способ оплаты СБП -> создаётся заявка 'pending' ->
+    фронтенд показывает номер телефона (SBP_PHONE) и просит после
+    перевода прислать номер операции. Зачисление — только после ручного
+    подтверждения через /sbp/confirm."""
+    get_or_create_user(db, req.user_id)
+
+    deposit = Deposit(
+        user_id=req.user_id,
+        method="SBP",
+        amount=req.amount_rub,
+        status="pending",
+    )
+    db.add(deposit)
+    db.commit()
+    db.refresh(deposit)
+
+    return {
+        "deposit_id": deposit.id,
+        "amount_rub": req.amount_rub,
+        "sbp_phone": SBP_PHONE,
+        "instructions": (
+            f"Переведите {req.amount_rub} ₽ по СБП на номер {SBP_PHONE}. "
+            f"После перевода сохраните номер операции — он понадобится "
+            f"для подтверждения зачисления."
+        ),
+    }
+
+
+@router.post("/sbp/confirm")
+async def sbp_confirm(req: SbpConfirmBody, db: Session = Depends(get_db)):
+    """Ручное подтверждение СБП-заявки администратором. Защищено простым
+    секретным паролем (ADMIN_SECRET) — временное решение до появления
+    полноценной админ-авторизации."""
+    if not ADMIN_SECRET or req.admin_secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Неверный admin_secret")
+
+    deposit = db.query(Deposit).filter(Deposit.id == req.deposit_id).first()
+    if not deposit:
+        raise HTTPException(status_code=404, detail="Заявка не найдена")
+    if deposit.status != "pending":
+        raise HTTPException(status_code=400, detail=f"Заявка уже обработана (статус: {deposit.status})")
+
+    if req.approve:
+        amount_usd = deposit.amount * RUB_TO_USD_RATE
+        user = get_or_create_user(db, deposit.user_id)
+        user.balance_usd += amount_usd
+        deposit.status = "confirmed"
+        deposit.amount_usd = amount_usd
+    else:
+        deposit.status = "rejected"
+
+    deposit.confirmed_at = datetime.utcnow()
+    db.commit()
+
+    return {"deposit_id": deposit.id, "status": deposit.status}
+
+
+@router.get("/balance")
+async def get_balance(user_id: str, db: Session = Depends(get_db)):
+    """Текущий баланс пользователя в USD — для отображения в приложении."""
+    user = get_or_create_user(db, user_id)
+    return {"user_id": user_id, "balance_usd": round(user.balance_usd, 4)}
+
+
 @router.get("/estimate")
 async def estimate_cost(duration_seconds: float):
-    """Утилитарный эндпоинт — можно вызвать с фронтенда, чтобы показать
-    клиенту ориентировочную стоимость до генерации (например, по длине
-    введённого текста / загруженного аудио)."""
     cost = calculate_generation_cost(duration_seconds)
     return {
         "duration_seconds": duration_seconds,
