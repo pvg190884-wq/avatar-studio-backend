@@ -14,6 +14,12 @@ RUNPOD_ENDPOINT_ID = os.getenv("RUNPOD_ENDPOINT_ID")
 RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY")
 RUNPOD_BASE_URL = f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}"
 
+# Кейс 3 (MuseTalk-липсинк) живёт на отдельном RunPod Serverless
+# эндпоинте (Avatar-Studio-Lipsync), отдельном от SadTalker/XTTS
+# (Avatar-Studio). API-ключ общий, endpoint ID — свой.
+RUNPOD_LIPSYNC_ENDPOINT_ID = os.getenv("RUNPOD_LIPSYNC_ENDPOINT_ID")
+RUNPOD_LIPSYNC_BASE_URL = f"https://api.runpod.ai/v2/{RUNPOD_LIPSYNC_ENDPOINT_ID}"
+
 TEMP_DIR = "data/runpod_tmp"
 OUTPUT_DIR = "data/outputs"
 os.makedirs(TEMP_DIR, exist_ok=True)
@@ -26,16 +32,21 @@ HEADERS = {
     "Authorization": f"Bearer {RUNPOD_API_KEY}"
 }
 
+# Префикс, которым помечаются job_id, отправленные на lipsync-эндпоинт,
+# чтобы GET /status/{job_id} знал, к какому RunPod-воркеру стучаться.
+# Формат отдаваемого клиенту job_id: "lipsync:<runpod_job_id>".
+LIPSYNC_PREFIX = "lipsync:"
+
 
 # ---------------------------------------------------------------------------
 # Важно: эндпоинты FastAPI ниже НЕ ждут завершения генерации внутри одного
 # HTTP-запроса. Railway (edge-прокси перед приложением) обрывает долгие
 # запросы своим собственным таймаутом независимо от кода приложения —
-# генерация видео (SadTalker + XTTS-v2) может занимать 5+ минут, что
-# превышает этот лимит. Поэтому используется схема submit → poll:
-#   1) POST /photo-text-emotion (или /photo-emotion) сразу отправляет
-#      задачу в RunPod и возвращает job_id — сам HTTP-запрос занимает
-#      секунды.
+# генерация видео (SadTalker + XTTS-v2 / MuseTalk) может занимать 5+ минут,
+# что превышает этот лимит. Поэтому используется схема submit → poll:
+#   1) POST /photo-text-emotion (или /photo-emotion, /lipsync) сразу
+#      отправляет задачу в RunPod и возвращает job_id — сам HTTP-запрос
+#      занимает секунды.
 #   2) Клиент (или тестировщик через Swagger/curl) опрашивает
 #      GET /status/{job_id} с любым интервалом, пока не получит готовое
 #      видео — каждый такой запрос тоже быстрый, так что Railway его не
@@ -98,6 +109,32 @@ def submit_photo_text_emotion_job(image_path: str, voice_sample_path: str, text:
         raise HTTPException(status_code=502, detail=f"RunPod не вернул id задачи: {job}")
 
     return job_id
+
+
+def submit_lipsync_job(video_path: str, audio_path: str) -> str:
+    """Кейс 3: отдельный RunPod-эндпоинт (MuseTalk). Возвращаемый job_id
+    помечается префиксом LIPSYNC_PREFIX, чтобы /status/{job_id} знал,
+    к какому воркеру идти за результатом."""
+    with open(video_path, "rb") as f:
+        video_b64 = base64.b64encode(f.read()).decode("utf-8")
+    with open(audio_path, "rb") as f:
+        audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    payload = {
+        "input": {
+            "video_base64": video_b64,
+            "audio_base64": audio_b64,
+        }
+    }
+
+    resp = requests.post(f"{RUNPOD_LIPSYNC_BASE_URL}/run", headers=HEADERS, json=payload, timeout=30)
+    resp.raise_for_status()
+    job = resp.json()
+    raw_job_id = job.get("id")
+    if not raw_job_id:
+        raise HTTPException(status_code=502, detail=f"RunPod (lipsync) не вернул id задачи: {job}")
+
+    return f"{LIPSYNC_PREFIX}{raw_job_id}"
 
 
 @router.post("/photo-emotion")
@@ -163,19 +200,57 @@ async def generate_photo_text_emotion(
     return {"job_id": job_id, "status_url": f"/api/generate/status/{job_id}"}
 
 
+@router.post("/lipsync")
+async def generate_lipsync(
+    video: UploadFile = File(...),
+    audio: UploadFile = File(...),
+):
+    """Кейс 3: видео с лицом + аудио-драйвер → липсинк через MuseTalk 1.5
+    на отдельном RunPod-эндпоинте. Сразу возвращает job_id — результат
+    забирается через GET /status/{job_id}, как и для кейсов 1/2."""
+    request_id = uuid.uuid4().hex
+    video_path = os.path.join(TEMP_DIR, f"{request_id}_{video.filename}")
+    audio_path = os.path.join(TEMP_DIR, f"{request_id}_{audio.filename}")
+
+    with open(video_path, "wb") as f:
+        f.write(await video.read())
+    with open(audio_path, "wb") as f:
+        f.write(await audio.read())
+
+    try:
+        job_id = submit_lipsync_job(video_path, audio_path)
+    finally:
+        for p in (video_path, audio_path):
+            if os.path.exists(p):
+                os.remove(p)
+
+    return {"job_id": job_id, "status_url": f"/api/generate/status/{job_id}"}
+
+
 @router.get("/status/{job_id}")
 async def get_job_status(job_id: str):
     """Опрашивается клиентом (или вручную через Swagger/curl) до тех пор,
     пока генерация не завершится. Быстрый запрос — не подвержен таймауту
-    Railway edge-прокси, в отличие от прямого ожидания результата."""
-    status_url = f"{RUNPOD_BASE_URL}/status/{job_id}"
+    Railway edge-прокси, в отличие от прямого ожидания результата.
+
+    job_id с префиксом "lipsync:" направляется на RunPod-эндпоинт Кейса 3
+    (MuseTalk), все остальные — на основной эндпоинт (SadTalker/XTTS,
+    Кейсы 1 и 2)."""
+    if job_id.startswith(LIPSYNC_PREFIX):
+        raw_job_id = job_id[len(LIPSYNC_PREFIX):]
+        base_url = RUNPOD_LIPSYNC_BASE_URL
+    else:
+        raw_job_id = job_id
+        base_url = RUNPOD_BASE_URL
+
+    status_url = f"{base_url}/status/{raw_job_id}"
     status_resp = requests.get(status_url, headers=HEADERS, timeout=30)
     data = status_resp.json()
     status = data.get("status")
 
     if status == "COMPLETED":
         video_b64 = data["output"]["video_base64"]
-        out_path = os.path.join(OUTPUT_DIR, f"{job_id}.mp4")
+        out_path = os.path.join(OUTPUT_DIR, f"{raw_job_id}.mp4")
         with open(out_path, "wb") as f:
             f.write(base64.b64decode(video_b64))
         return FileResponse(out_path, media_type="video/mp4", filename="avatar_result.mp4")
