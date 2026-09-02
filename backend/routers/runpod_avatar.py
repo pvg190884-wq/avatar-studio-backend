@@ -3,6 +3,7 @@ import json
 import base64
 import time
 import uuid
+import asyncio
 import requests
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse
@@ -156,7 +157,14 @@ async def generate_photo_emotion(
         f.write(await audio.read())
 
     try:
-        job_id = submit_sadtalker_job(
+        # ВАЖНО: submit_sadtalker_job внутри делает синхронный (блокирующий)
+        # requests.post к RunPod. Вызванный напрямую внутри async-эндпоинта,
+        # такой блокирующий вызов останавливает ВЕСЬ event loop на время
+        # ожидания ответа от RunPod — сервер перестаёт отвечать вообще всем
+        # клиентам, что выглядит как массовый "Failed to fetch". Поэтому
+        # выполняем его в отдельном потоке через asyncio.to_thread.
+        job_id = await asyncio.to_thread(
+            submit_sadtalker_job,
             image_path, audio_path,
             expression_scale=expression_scale,
             pose_style=pose_style
@@ -189,7 +197,10 @@ async def generate_photo_text_emotion(
         f.write(await voice_sample.read())
 
     try:
-        job_id = submit_photo_text_emotion_job(
+        # См. комментарий в generate_photo_emotion — уводим блокирующий
+        # HTTP-вызов к RunPod в отдельный поток, чтобы не вешать сервер.
+        job_id = await asyncio.to_thread(
+            submit_photo_text_emotion_job,
             image_path, voice_path, text, emotion, language
         )
     finally:
@@ -218,7 +229,9 @@ async def generate_lipsync(
         f.write(await audio.read())
 
     try:
-        job_id = submit_lipsync_job(video_path, audio_path)
+        # См. комментарий в generate_photo_emotion — уводим блокирующий
+        # HTTP-вызов к RunPod в отдельный поток, чтобы не вешать сервер.
+        job_id = await asyncio.to_thread(submit_lipsync_job, video_path, audio_path)
     finally:
         for p in (video_path, audio_path):
             if os.path.exists(p):
@@ -244,15 +257,24 @@ async def get_job_status(job_id: str):
         base_url = RUNPOD_BASE_URL
 
     status_url = f"{base_url}/status/{raw_job_id}"
-    status_resp = requests.get(status_url, headers=HEADERS, timeout=30)
+    # Тот же блокирующий HTTP-вызов, что и при отправке задачи — этот
+    # эндпоинт дёргается фронтендом каждые несколько секунд, поэтому
+    # особенно важно не блокировать event loop именно здесь.
+    status_resp = await asyncio.to_thread(requests.get, status_url, headers=HEADERS, timeout=30)
     data = status_resp.json()
     status = data.get("status")
 
     if status == "COMPLETED":
         video_b64 = data["output"]["video_base64"]
         out_path = os.path.join(OUTPUT_DIR, f"{raw_job_id}.mp4")
-        with open(out_path, "wb") as f:
-            f.write(base64.b64decode(video_b64))
+
+        def _write_video():
+            with open(out_path, "wb") as f:
+                f.write(base64.b64decode(video_b64))
+
+        # Декодирование base64 и запись на диск — тоже блокирующие
+        # операции, для крупных видео могут занимать заметное время.
+        await asyncio.to_thread(_write_video)
         return FileResponse(out_path, media_type="video/mp4", filename="avatar_result.mp4")
 
     if status == "FAILED":
