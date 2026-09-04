@@ -306,3 +306,38 @@ async def get_job_status(job_id: str):
 
     # IN_QUEUE / IN_PROGRESS и т.п. — сообщаем клиенту, что нужно спросить позже
     return {"job_id": job_id, "status": status}
+
+
+@router.get("/debug/runpod-ping")
+async def debug_runpod_ping():
+    """Временный диагностический эндпоинт: проверяет сетевую связность
+    Railway -> RunPod напрямую (через /health каждого эндпоинта, без
+    траты GPU-времени) и замеряет, сколько это реально занимает.
+    Открывается просто как ссылка в браузере — не требует Swagger,
+    curl или ручного ввода токенов. Удалить после того, как проблема
+    с "Failed to fetch" будет найдена и решена."""
+    endpoints = {
+        "sadtalker_xtts": RUNPOD_BASE_URL,
+        "lipsync": RUNPOD_LIPSYNC_BASE_URL,
+    }
+    results = {}
+    for name, base_url in endpoints.items():
+        start = time.time()
+        try:
+            resp = await asyncio.to_thread(requests.get, f"{base_url}/health", headers=HEADERS, timeout=20)
+            elapsed = round(time.time() - start, 2)
+            try:
+                body = resp.json()
+            except Exception:
+                body = resp.text[:500]
+            results[name] = {"ok": True, "status_code": resp.status_code, "elapsed_sec": elapsed, "body": body}
+        except requests.exceptions.RequestException as e:
+            elapsed = round(time.time() - start, 2)
+            results[name] = {"ok": False, "elapsed_sec": elapsed, "error": str(e)}
+
+    results["env_check"] = {
+        "runpod_api_key_set": bool(RUNPOD_API_KEY),
+        "runpod_endpoint_id_set": bool(RUNPOD_ENDPOINT_ID),
+        "runpod_lipsync_endpoint_id_set": bool(RUNPOD_LIPSYNC_ENDPOINT_ID),
+    }
+    return results
