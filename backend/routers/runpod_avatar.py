@@ -341,3 +341,52 @@ async def debug_runpod_ping():
         "runpod_lipsync_endpoint_id_set": bool(RUNPOD_LIPSYNC_ENDPOINT_ID),
     }
     return results
+
+
+@router.get("/debug/runpod-run-ping")
+async def debug_runpod_run_ping():
+    """Проверяет именно POST /run (постановку задачи в очередь) — а не
+    /health, который лишь подтверждает, что воркер жив, но не проходит
+    через ту же логику приёма задачи. Использует поддерживаемый обоими
+    воркерами режим {"input": {"healthcheck": true}} — он завершается
+    почти мгновенно на стороне воркера, без реальной GPU-генерации, так
+    что тест ничего не стоит по деньгам и времени GPU."""
+    endpoints = {
+        "sadtalker_xtts": RUNPOD_BASE_URL,
+        "lipsync": RUNPOD_LIPSYNC_BASE_URL,
+    }
+    results = {}
+    for name, base_url in endpoints.items():
+        entry = {}
+        # Шаг 1: POST /run с healthcheck-пейлоадом
+        start = time.time()
+        try:
+            resp = await asyncio.to_thread(
+                requests.post, f"{base_url}/run", headers=HEADERS,
+                json={"input": {"healthcheck": True}}, timeout=30
+            )
+            run_elapsed = round(time.time() - start, 2)
+            resp.raise_for_status()
+            job = resp.json()
+            entry["run_elapsed_sec"] = run_elapsed
+            entry["run_status_code"] = resp.status_code
+            entry["run_response"] = job
+            job_id = job.get("id")
+
+            # Шаг 2: сразу опрашиваем статус — healthcheck-задача должна
+            # завершиться почти мгновенно
+            if job_id:
+                start2 = time.time()
+                status_resp = await asyncio.to_thread(
+                    requests.get, f"{base_url}/status/{job_id}", headers=HEADERS, timeout=20
+                )
+                status_elapsed = round(time.time() - start2, 2)
+                entry["status_elapsed_sec"] = status_elapsed
+                entry["status_response"] = status_resp.json()
+        except requests.exceptions.RequestException as e:
+            entry["error"] = str(e)
+            entry["elapsed_sec_before_error"] = round(time.time() - start, 2)
+
+        results[name] = entry
+
+    return results
