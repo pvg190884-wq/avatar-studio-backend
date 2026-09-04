@@ -75,8 +75,18 @@ def submit_sadtalker_job(image_path: str, audio_path: str, expression_scale: flo
         }
     }
 
-    resp = requests.post(f"{RUNPOD_BASE_URL}/run", headers=HEADERS, json=payload, timeout=30)
-    resp.raise_for_status()
+    # ВАЖНО: запрос к RunPod оборачиваем в try/except. Раньше сетевая
+    # ошибка (недоступный эндпоинт, неверный ID, таймаут и т.п.) здесь
+    # улетала наверх необработанной, что на стороне Railway иногда
+    # приводит к обрыву соединения без внятного ответа — на фронтенде
+    # это выглядит как generic "Failed to fetch" без единой зацепки,
+    # что именно сломалось.
+    try:
+        resp = requests.post(f"{RUNPOD_BASE_URL}/run", headers=HEADERS, json=payload, timeout=30)
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Не удалось связаться с RunPod (SadTalker): {e}")
+
     job = resp.json()
     job_id = job.get("id")
     if not job_id:
@@ -102,8 +112,12 @@ def submit_photo_text_emotion_job(image_path: str, voice_sample_path: str, text:
         }
     }
 
-    resp = requests.post(f"{RUNPOD_BASE_URL}/run", headers=HEADERS, json=payload, timeout=30)
-    resp.raise_for_status()
+    try:
+        resp = requests.post(f"{RUNPOD_BASE_URL}/run", headers=HEADERS, json=payload, timeout=30)
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Не удалось связаться с RunPod (SadTalker/XTTS): {e}")
+
     job = resp.json()
     job_id = job.get("id")
     if not job_id:
@@ -116,6 +130,12 @@ def submit_lipsync_job(video_path: str, audio_path: str) -> str:
     """Кейс 3: отдельный RunPod-эндпоинт (MuseTalk). Возвращаемый job_id
     помечается префиксом LIPSYNC_PREFIX, чтобы /status/{job_id} знал,
     к какому воркеру идти за результатом."""
+    if not RUNPOD_LIPSYNC_ENDPOINT_ID:
+        raise HTTPException(
+            status_code=500,
+            detail="RUNPOD_LIPSYNC_ENDPOINT_ID не задан на сервере — проверь переменные окружения Railway"
+        )
+
     with open(video_path, "rb") as f:
         video_b64 = base64.b64encode(f.read()).decode("utf-8")
     with open(audio_path, "rb") as f:
@@ -128,8 +148,12 @@ def submit_lipsync_job(video_path: str, audio_path: str) -> str:
         }
     }
 
-    resp = requests.post(f"{RUNPOD_LIPSYNC_BASE_URL}/run", headers=HEADERS, json=payload, timeout=30)
-    resp.raise_for_status()
+    try:
+        resp = requests.post(f"{RUNPOD_LIPSYNC_BASE_URL}/run", headers=HEADERS, json=payload, timeout=30)
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Не удалось связаться с RunPod (lipsync): {e}")
+
     job = resp.json()
     raw_job_id = job.get("id")
     if not raw_job_id:
