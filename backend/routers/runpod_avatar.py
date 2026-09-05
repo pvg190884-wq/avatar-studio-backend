@@ -5,9 +5,15 @@ import time
 import uuid
 import asyncio
 import requests
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from fastapi.responses import FileResponse
+from sqlalchemy.orm import Session
+from mutagen import File as MutagenFile
 from dotenv import load_dotenv
+
+from database import get_db
+from auth_utils import get_current_user_id
+from routers.billing import calculate_generation_cost, get_or_create_user
 
 load_dotenv()
 
@@ -20,6 +26,13 @@ RUNPOD_BASE_URL = f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}"
 # (Avatar-Studio). API-ключ общий, endpoint ID — свой.
 RUNPOD_LIPSYNC_ENDPOINT_ID = os.getenv("RUNPOD_LIPSYNC_ENDPOINT_ID")
 RUNPOD_LIPSYNC_BASE_URL = f"https://api.runpod.ai/v2/{RUNPOD_LIPSYNC_ENDPOINT_ID}"
+
+# Список user_id (из Supabase, тот же формат, что отдаёт
+# GET /api/billing/balance в поле "user_id"), для которых генерация
+# НЕ списывает баланс — например, твой собственный аккаунт для
+# тестирования. Задаётся через Railway Variables, через запятую:
+# UNLIMITED_USER_IDS=abc-123-...,def-456-...
+UNLIMITED_USER_IDS = {u.strip() for u in os.getenv("UNLIMITED_USER_IDS", "").split(",") if u.strip()}
 
 TEMP_DIR = "data/runpod_tmp"
 OUTPUT_DIR = "data/outputs"
@@ -34,9 +47,41 @@ HEADERS = {
 }
 
 # Префикс, которым помечаются job_id, отправленные на lipsync-эндпоинт,
-# чтобы GET /status/{job_id} знал, к какому RunPod-воркеру стучаться.
-# Формат отдаваемого клиенту job_id: "lipsync:<runpod_job_id>".
+# чтобы GET /status/{job_id} знал, к какому воркеру стучаться.
 LIPSYNC_PREFIX = "lipsync:"
+
+# Кейс 1 (текст -> TTS -> видео): длительность озвучки известна только
+# после реальной генерации, поэтому списание баланса откладывается до
+# момента получения готового видео в /status/{job_id}. Здесь храним,
+# какому пользователю принадлежит задача. ВАЖНО: это простое решение
+# "в памяти процесса" — при рестарте/редеплое Railway между отправкой
+# задачи и её завершением запись потеряется и списание для этой
+# конкретной задачи не произойдёт (редкий, но возможный случай).
+JOB_OWNERS: dict[str, str] = {}
+
+
+def get_media_duration_seconds(path: str) -> float:
+    """Читает реальную длительность аудио/видео файла на диске через
+    mutagen — сервер не доверяет числам, которые прислал клиент."""
+    media = MutagenFile(path)
+    if media is None or media.info is None or not hasattr(media.info, "length"):
+        raise HTTPException(status_code=422, detail="Не удалось определить длительность файла")
+    return float(media.info.length)
+
+
+def charge_user(db: Session, user_id: str, cost: float):
+    """Списывает cost с баланса пользователя, если он не в списке
+    освобождённых от оплаты. Бросает 402, если средств не хватает."""
+    if user_id in UNLIMITED_USER_IDS:
+        return
+    user = get_or_create_user(db, user_id)
+    if user.balance_usd < cost:
+        raise HTTPException(
+            status_code=402,
+            detail=f"Недостаточно средств: нужно ${cost:.4f}, на балансе ${user.balance_usd:.4f}"
+        )
+    user.balance_usd -= cost
+    db.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -48,10 +93,9 @@ LIPSYNC_PREFIX = "lipsync:"
 #   1) POST /photo-text-emotion (или /photo-emotion, /lipsync) сразу
 #      отправляет задачу в RunPod и возвращает job_id — сам HTTP-запрос
 #      занимает секунды.
-#   2) Клиент (или тестировщик через Swagger/curl) опрашивает
-#      GET /status/{job_id} с любым интервалом, пока не получит готовое
-#      видео — каждый такой запрос тоже быстрый, так что Railway его не
-#      обрывает.
+#   2) Клиент опрашивает GET /status/{job_id} с любым интервалом, пока
+#      не получит готовое видео — каждый такой запрос тоже быстрый, так
+#      что Railway его не обрывает.
 # ---------------------------------------------------------------------------
 
 
@@ -75,12 +119,6 @@ def submit_sadtalker_job(image_path: str, audio_path: str, expression_scale: flo
         }
     }
 
-    # ВАЖНО: запрос к RunPod оборачиваем в try/except. Раньше сетевая
-    # ошибка (недоступный эндпоинт, неверный ID, таймаут и т.п.) здесь
-    # улетала наверх необработанной, что на стороне Railway иногда
-    # приводит к обрыву соединения без внятного ответа — на фронтенде
-    # это выглядит как generic "Failed to fetch" без единой зацепки,
-    # что именно сломалось.
     try:
         resp = requests.post(f"{RUNPOD_BASE_URL}/run", headers=HEADERS, json=payload, timeout=30)
         resp.raise_for_status()
@@ -127,9 +165,7 @@ def submit_photo_text_emotion_job(image_path: str, voice_sample_path: str, text:
 
 
 def submit_lipsync_job(video_path: str, audio_path: str) -> str:
-    """Кейс 3: отдельный RunPod-эндпоинт (MuseTalk). Возвращаемый job_id
-    помечается префиксом LIPSYNC_PREFIX, чтобы /status/{job_id} знал,
-    к какому воркеру идти за результатом."""
+    """Кейс 3: отдельный RunPod-эндпоинт (MuseTalk)."""
     if not RUNPOD_LIPSYNC_ENDPOINT_ID:
         raise HTTPException(
             status_code=500,
@@ -167,10 +203,14 @@ async def generate_photo_emotion(
     image: UploadFile = File(...),
     audio: UploadFile = File(...),
     expression_scale: float = Form(0.7),
-    pose_style: int = Form(0)
+    pose_style: int = Form(0),
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
 ):
     """Кейс 2: фото + аудио, модель сама подстраивает эмоции под голос.
-    Сразу возвращает job_id — результат забирается через GET /status/{job_id}."""
+    Списывает баланс сразу — длительность известна по загруженному
+    аудио. Сразу возвращает job_id — результат забирается через
+    GET /status/{job_id}."""
     request_id = uuid.uuid4().hex
     image_path = os.path.join(TEMP_DIR, f"{request_id}_{image.filename}")
     audio_path = os.path.join(TEMP_DIR, f"{request_id}_{audio.filename}")
@@ -181,12 +221,10 @@ async def generate_photo_emotion(
         f.write(await audio.read())
 
     try:
-        # ВАЖНО: submit_sadtalker_job внутри делает синхронный (блокирующий)
-        # requests.post к RunPod. Вызванный напрямую внутри async-эндпоинта,
-        # такой блокирующий вызов останавливает ВЕСЬ event loop на время
-        # ожидания ответа от RunPod — сервер перестаёт отвечать вообще всем
-        # клиентам, что выглядит как массовый "Failed to fetch". Поэтому
-        # выполняем его в отдельном потоке через asyncio.to_thread.
+        duration = get_media_duration_seconds(audio_path)
+        cost = calculate_generation_cost(duration)
+        charge_user(db, user_id, cost)
+
         job_id = await asyncio.to_thread(
             submit_sadtalker_job,
             image_path, audio_path,
@@ -207,10 +245,13 @@ async def generate_photo_text_emotion(
     voice_sample: UploadFile = File(...),
     text: str = Form(...),
     emotion: str = Form("neutral"),
-    language: str = Form("ru")
+    language: str = Form("ru"),
+    user_id: str = Depends(get_current_user_id),
 ):
-    """Кейс 1: фото + образец голоса + текст + выбор эмоции.
-    Сразу возвращает job_id — результат забирается через GET /status/{job_id}."""
+    """Кейс 1: фото + образец голоса + текст + выбор эмоции. Длительность
+    озвучки известна только после реального TTS, поэтому списание
+    баланса откладывается до момента, когда видео будет готово (см.
+    /status/{job_id}). Сразу возвращает job_id."""
     request_id = uuid.uuid4().hex
     image_path = os.path.join(TEMP_DIR, f"{request_id}_{image.filename}")
     voice_path = os.path.join(TEMP_DIR, f"{request_id}_{voice_sample.filename}")
@@ -221,8 +262,6 @@ async def generate_photo_text_emotion(
         f.write(await voice_sample.read())
 
     try:
-        # См. комментарий в generate_photo_emotion — уводим блокирующий
-        # HTTP-вызов к RunPod в отдельный поток, чтобы не вешать сервер.
         job_id = await asyncio.to_thread(
             submit_photo_text_emotion_job,
             image_path, voice_path, text, emotion, language
@@ -232,6 +271,7 @@ async def generate_photo_text_emotion(
             if os.path.exists(p):
                 os.remove(p)
 
+    JOB_OWNERS[job_id] = user_id
     return {"job_id": job_id, "status_url": f"/api/generate/status/{job_id}"}
 
 
@@ -239,10 +279,12 @@ async def generate_photo_text_emotion(
 async def generate_lipsync(
     video: UploadFile = File(...),
     audio: UploadFile = File(...),
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
 ):
-    """Кейс 3: видео с лицом + аудио-драйвер → липсинк через MuseTalk 1.5
-    на отдельном RunPod-эндпоинте. Сразу возвращает job_id — результат
-    забирается через GET /status/{job_id}, как и для кейсов 1/2."""
+    """Кейс 3: видео с лицом + аудио-драйвер → липсинк через MuseTalk 1.5.
+    Списывает баланс сразу — длительность известна по загруженному
+    аудио-драйверу."""
     request_id = uuid.uuid4().hex
     video_path = os.path.join(TEMP_DIR, f"{request_id}_{video.filename}")
     audio_path = os.path.join(TEMP_DIR, f"{request_id}_{audio.filename}")
@@ -253,8 +295,10 @@ async def generate_lipsync(
         f.write(await audio.read())
 
     try:
-        # См. комментарий в generate_photo_emotion — уводим блокирующий
-        # HTTP-вызов к RunPod в отдельный поток, чтобы не вешать сервер.
+        duration = get_media_duration_seconds(audio_path)
+        cost = calculate_generation_cost(duration)
+        charge_user(db, user_id, cost)
+
         job_id = await asyncio.to_thread(submit_lipsync_job, video_path, audio_path)
     finally:
         for p in (video_path, audio_path):
@@ -265,10 +309,8 @@ async def generate_lipsync(
 
 
 @router.get("/status/{job_id}")
-async def get_job_status(job_id: str):
-    """Опрашивается клиентом (или вручную через Swagger/curl) до тех пор,
-    пока генерация не завершится. Быстрый запрос — не подвержен таймауту
-    Railway edge-прокси, в отличие от прямого ожидания результата.
+async def get_job_status(job_id: str, db: Session = Depends(get_db)):
+    """Опрашивается клиентом до тех пор, пока генерация не завершится.
 
     job_id с префиксом "lipsync:" направляется на RunPod-эндпоинт Кейса 3
     (MuseTalk), все остальные — на основной эндпоинт (SadTalker/XTTS,
@@ -281,9 +323,6 @@ async def get_job_status(job_id: str):
         base_url = RUNPOD_BASE_URL
 
     status_url = f"{base_url}/status/{raw_job_id}"
-    # Тот же блокирующий HTTP-вызов, что и при отправке задачи — этот
-    # эндпоинт дёргается фронтендом каждые несколько секунд, поэтому
-    # особенно важно не блокировать event loop именно здесь.
     status_resp = await asyncio.to_thread(requests.get, status_url, headers=HEADERS, timeout=30)
     data = status_resp.json()
     status = data.get("status")
@@ -291,35 +330,46 @@ async def get_job_status(job_id: str):
     if status == "COMPLETED":
         video_b64 = data["output"]["video_base64"]
         out_path = os.path.join(OUTPUT_DIR, f"{raw_job_id}.mp4")
+        # Идемпотентность: если файл уже записан (повторный опрос статуса
+        # после завершения), не перезаписываем и, что важнее, НЕ списываем
+        # баланс повторно за ту же задачу.
+        first_time = not os.path.exists(out_path)
 
-        def _write_video():
-            with open(out_path, "wb") as f:
-                f.write(base64.b64decode(video_b64))
+        if first_time:
+            def _write_video():
+                with open(out_path, "wb") as f:
+                    f.write(base64.b64decode(video_b64))
 
-        # Декодирование base64 и запись на диск — тоже блокирующие
-        # операции, для крупных видео могут занимать заметное время.
-        await asyncio.to_thread(_write_video)
+            await asyncio.to_thread(_write_video)
+
+            # Отложенное списание для Кейса 1 (текст -> TTS) — длительность
+            # известна только сейчас, по факту готового видео.
+            owner_user_id = JOB_OWNERS.pop(job_id, None)
+            if owner_user_id:
+                try:
+                    actual_duration = get_media_duration_seconds(out_path)
+                    cost = calculate_generation_cost(actual_duration)
+                    charge_user(db, owner_user_id, cost)
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    # Не блокируем выдачу готового видео из-за сбоя биллинга —
+                    # просто логируем, разберёмся постфактум.
+                    print(f"Не удалось списать средства за задачу {job_id}: {e}")
+
         return FileResponse(out_path, media_type="video/mp4", filename="avatar_result.mp4")
 
     if status == "FAILED":
         raise HTTPException(status_code=502, detail=f"Генерация упала: {data}")
 
-    # IN_QUEUE / IN_PROGRESS и т.п. — сообщаем клиенту, что нужно спросить позже
     return {"job_id": job_id, "status": status}
 
 
 @router.get("/debug/runpod-ping")
 async def debug_runpod_ping():
-    """Временный диагностический эндпоинт: проверяет сетевую связность
-    Railway -> RunPod напрямую (через /health каждого эндпоинта, без
-    траты GPU-времени) и замеряет, сколько это реально занимает.
-    Открывается просто как ссылка в браузере — не требует Swagger,
-    curl или ручного ввода токенов. Удалить после того, как проблема
-    с "Failed to fetch" будет найдена и решена."""
-    endpoints = {
-        "sadtalker_xtts": RUNPOD_BASE_URL,
-        "lipsync": RUNPOD_LIPSYNC_BASE_URL,
-    }
+    """Временный диагностический эндпоинт — см. историю чата. Можно
+    удалить, когда стабильность будет подтверждена окончательно."""
+    endpoints = {"sadtalker_xtts": RUNPOD_BASE_URL, "lipsync": RUNPOD_LIPSYNC_BASE_URL}
     results = {}
     for name, base_url in endpoints.items():
         start = time.time()
@@ -332,9 +382,7 @@ async def debug_runpod_ping():
                 body = resp.text[:500]
             results[name] = {"ok": True, "status_code": resp.status_code, "elapsed_sec": elapsed, "body": body}
         except requests.exceptions.RequestException as e:
-            elapsed = round(time.time() - start, 2)
-            results[name] = {"ok": False, "elapsed_sec": elapsed, "error": str(e)}
-
+            results[name] = {"ok": False, "elapsed_sec": round(time.time() - start, 2), "error": str(e)}
     results["env_check"] = {
         "runpod_api_key_set": bool(RUNPOD_API_KEY),
         "runpod_endpoint_id_set": bool(RUNPOD_ENDPOINT_ID),
@@ -345,48 +393,32 @@ async def debug_runpod_ping():
 
 @router.get("/debug/runpod-run-ping")
 async def debug_runpod_run_ping():
-    """Проверяет именно POST /run (постановку задачи в очередь) — а не
-    /health, который лишь подтверждает, что воркер жив, но не проходит
-    через ту же логику приёма задачи. Использует поддерживаемый обоими
-    воркерами режим {"input": {"healthcheck": true}} — он завершается
-    почти мгновенно на стороне воркера, без реальной GPU-генерации, так
-    что тест ничего не стоит по деньгам и времени GPU."""
-    endpoints = {
-        "sadtalker_xtts": RUNPOD_BASE_URL,
-        "lipsync": RUNPOD_LIPSYNC_BASE_URL,
-    }
+    """Проверяет именно POST /run — см. историю чата."""
+    endpoints = {"sadtalker_xtts": RUNPOD_BASE_URL, "lipsync": RUNPOD_LIPSYNC_BASE_URL}
     results = {}
     for name, base_url in endpoints.items():
         entry = {}
-        # Шаг 1: POST /run с healthcheck-пейлоадом
         start = time.time()
         try:
             resp = await asyncio.to_thread(
                 requests.post, f"{base_url}/run", headers=HEADERS,
                 json={"input": {"healthcheck": True}}, timeout=30
             )
-            run_elapsed = round(time.time() - start, 2)
+            entry["run_elapsed_sec"] = round(time.time() - start, 2)
             resp.raise_for_status()
             job = resp.json()
-            entry["run_elapsed_sec"] = run_elapsed
             entry["run_status_code"] = resp.status_code
             entry["run_response"] = job
             job_id = job.get("id")
-
-            # Шаг 2: сразу опрашиваем статус — healthcheck-задача должна
-            # завершиться почти мгновенно
             if job_id:
                 start2 = time.time()
                 status_resp = await asyncio.to_thread(
                     requests.get, f"{base_url}/status/{job_id}", headers=HEADERS, timeout=20
                 )
-                status_elapsed = round(time.time() - start2, 2)
-                entry["status_elapsed_sec"] = status_elapsed
+                entry["status_elapsed_sec"] = round(time.time() - start2, 2)
                 entry["status_response"] = status_resp.json()
         except requests.exceptions.RequestException as e:
             entry["error"] = str(e)
             entry["elapsed_sec_before_error"] = round(time.time() - start, 2)
-
         results[name] = entry
-
     return results
