@@ -3,6 +3,7 @@ import json
 import base64
 import time
 import uuid
+import shutil
 import asyncio
 import requests
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
@@ -198,6 +199,67 @@ def submit_lipsync_job(video_path: str, audio_path: str) -> str:
     return f"{LIPSYNC_PREFIX}{raw_job_id}"
 
 
+def poll_runpod_job_sync(base_url: str, job_id: str, timeout: float = 120, interval: float = 3) -> dict:
+    """Синхронно ждёт завершения RunPod-задачи, опрашивая /status в цикле.
+    Используется только для промежуточного шага TTS внутри Кейса 3 с
+    текстом — сам TTS обычно занимает 5-20 секунд для короткого текста,
+    так что короткое блокирующее ожидание внутри уже вынесенного в
+    отдельный поток вызова (asyncio.to_thread) приемлемо и не грозит
+    подвесить сервер, в отличие от долгой видео-генерации."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        resp = requests.get(f"{base_url}/status/{job_id}", headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        status = data.get("status")
+        if status == "COMPLETED":
+            return data
+        if status == "FAILED":
+            raise HTTPException(status_code=502, detail=f"Озвучка текста упала: {data}")
+        time.sleep(interval)
+    raise HTTPException(status_code=504, detail="Озвучка текста не успела завершиться вовремя")
+
+
+def synthesize_tts_via_runpod(voice_sample_path: str, text: str, language: str, work_dir: str) -> tuple[str, float]:
+    """Шаг 1 для Кейса 3 с текстом вместо готового аудио: озвучивает
+    текст через SadTalker/XTTS-воркер в режиме tts_only (без генерации
+    видео — воркер просто возвращает audio_base64). Возвращает путь к
+    получившемуся .wav-файлу и его реальную длительность в секундах."""
+    with open(voice_sample_path, "rb") as f:
+        voice_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    payload = {
+        "input": {
+            "tts_only": True,
+            "text": text,
+            "voice_sample_base64": voice_b64,
+            "language": language,
+        }
+    }
+    try:
+        resp = requests.post(f"{RUNPOD_BASE_URL}/run", headers=HEADERS, json=payload, timeout=30)
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Не удалось запустить озвучку текста: {e}")
+
+    job = resp.json()
+    job_id = job.get("id")
+    if not job_id:
+        raise HTTPException(status_code=502, detail=f"RunPod не вернул id задачи озвучки: {job}")
+
+    result = poll_runpod_job_sync(RUNPOD_BASE_URL, job_id)
+    audio_b64 = result.get("output", {}).get("audio_base64")
+    if not audio_b64:
+        raise HTTPException(status_code=502, detail=f"Озвучка не вернула audio_base64: {result}")
+
+    audio_path = os.path.join(work_dir, "tts_output.wav")
+    with open(audio_path, "wb") as f:
+        f.write(base64.b64decode(audio_b64))
+
+    duration = get_media_duration_seconds(audio_path)
+    return audio_path, duration
+
+
 @router.post("/photo-emotion")
 async def generate_photo_emotion(
     image: UploadFile = File(...),
@@ -304,6 +366,50 @@ async def generate_lipsync(
         for p in (video_path, audio_path):
             if os.path.exists(p):
                 os.remove(p)
+
+    return {"job_id": job_id, "status_url": f"/api/generate/status/{job_id}"}
+
+
+@router.post("/lipsync-from-text")
+async def generate_lipsync_from_text(
+    video: UploadFile = File(...),
+    voice_sample: UploadFile = File(...),
+    text: str = Form(...),
+    language: str = Form("ru"),
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """Кейс 3 с текстом вместо готового аудио: сначала озвучивает текст
+    через SadTalker/XTTS-воркер в режиме tts_only (клонирование голоса
+    по voice_sample, тот же движок, что в Кейсе 1), затем накладывает
+    липсинк получившейся озвучки на исходное видео через MuseTalk.
+
+    Длительность и стоимость известны только после реальной озвучки —
+    поэтому TTS-шаг выполняется синхронно внутри этого запроса (обычно
+    5-20 секунд для короткого текста), баланс списывается сразу после
+    него и ДО отправки более дорогой финальной задачи в очередь."""
+    request_id = uuid.uuid4().hex
+    work_dir = os.path.join(TEMP_DIR, request_id)
+    os.makedirs(work_dir, exist_ok=True)
+    video_path = os.path.join(work_dir, f"video_{video.filename}")
+    voice_path = os.path.join(work_dir, f"voice_{voice_sample.filename}")
+
+    with open(video_path, "wb") as f:
+        f.write(await video.read())
+    with open(voice_path, "wb") as f:
+        f.write(await voice_sample.read())
+
+    try:
+        audio_path, duration = await asyncio.to_thread(
+            synthesize_tts_via_runpod, voice_path, text, language, work_dir
+        )
+
+        cost = calculate_generation_cost(duration)
+        charge_user(db, user_id, cost)
+
+        job_id = await asyncio.to_thread(submit_lipsync_job, video_path, audio_path)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
     return {"job_id": job_id, "status_url": f"/api/generate/status/{job_id}"}
 
