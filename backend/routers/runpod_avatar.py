@@ -35,6 +35,23 @@ RUNPOD_LIPSYNC_BASE_URL = f"https://api.runpod.ai/v2/{RUNPOD_LIPSYNC_ENDPOINT_ID
 # UNLIMITED_USER_IDS=abc-123-...,def-456-...
 UNLIMITED_USER_IDS = {u.strip() for u in os.getenv("UNLIMITED_USER_IDS", "").split(",") if u.strip()}
 
+# Supabase Storage — используется для приёма крупных видео Кейса 3
+# напрямую от клиента, в обход Railway (см. диагностику "Failed to
+# fetch" на видео >= 8МБ). Бэкенд выдаёт клиенту одноразовую подписанную
+# ссылку на загрузку (POST /upload-url), клиент грузит файл напрямую
+# в Storage, а бэкенд потом сам скачивает его оттуда через service_role
+# ключ — минуя edge-прокси Railway и любые ограничения сети клиента.
+SUPABASE_PROJECT_REF = "cyefnlaxsammhmoqaonu"
+SUPABASE_URL = os.getenv("SUPABASE_URL", f"https://{SUPABASE_PROJECT_REF}.supabase.co")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_STORAGE_URL = f"{SUPABASE_URL}/storage/v1"
+LIPSYNC_UPLOAD_BUCKET = "lipsync-uploads"
+
+SUPABASE_SERVICE_HEADERS = {
+    "apikey": SUPABASE_SERVICE_ROLE_KEY or "",
+    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+}
+
 TEMP_DIR = "data/runpod_tmp"
 OUTPUT_DIR = "data/outputs"
 os.makedirs(TEMP_DIR, exist_ok=True)
@@ -83,6 +100,40 @@ def charge_user(db: Session, user_id: str, cost: float):
         )
     user.balance_usd -= cost
     db.commit()
+
+
+def download_from_supabase_storage(bucket: str, path: str, dest_path: str):
+    """Скачивает файл, который клиент загрузил напрямую в Supabase
+    Storage (в обход Railway), на диск бэкенда — используется вместо
+    приёма видео через UploadFile для Кейса 3."""
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=500, detail="SUPABASE_SERVICE_ROLE_KEY не задан на сервере")
+    try:
+        resp = requests.get(
+            f"{SUPABASE_STORAGE_URL}/object/{bucket}/{path}",
+            headers=SUPABASE_SERVICE_HEADERS,
+            timeout=120,
+        )
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Не удалось скачать видео из Storage: {e}")
+    with open(dest_path, "wb") as f:
+        f.write(resp.content)
+
+
+def delete_from_supabase_storage(bucket: str, path: str):
+    """Подчищает временный объект после того, как видео скачано и задача
+    отправлена в RunPod. Best-effort — сбой удаления не должен ронять
+    генерацию, просто оставит мусор в бакете."""
+    try:
+        requests.delete(
+            f"{SUPABASE_STORAGE_URL}/object/{bucket}",
+            headers={**SUPABASE_SERVICE_HEADERS, "Content-Type": "application/json"},
+            json={"prefixes": [path]},
+            timeout=20,
+        )
+    except requests.exceptions.RequestException:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -260,6 +311,46 @@ def synthesize_tts_via_runpod(voice_sample_path: str, text: str, language: str, 
     return audio_path, duration
 
 
+@router.post("/upload-url")
+async def create_video_upload_url(
+    filename: str = Form(...),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Выдаёт клиенту одноразовую подписанную ссылку для загрузки видео
+    НАПРЯМУЮ в Supabase Storage, в обход Railway — только так большой
+    файл не зависит от скорости/файрвола клиентской сети и не рискует
+    упереться в таймаут прокси Railway на приёме тела запроса."""
+    if not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=500, detail="SUPABASE_SERVICE_ROLE_KEY не задан на сервере")
+
+    safe_name = os.path.basename(filename) or "upload.bin"
+    object_path = f"{user_id}/{uuid.uuid4().hex}_{safe_name}"
+
+    def _create_signed_upload_url():
+        resp = requests.post(
+            f"{SUPABASE_STORAGE_URL}/object/upload/sign/{LIPSYNC_UPLOAD_BUCKET}/{object_path}",
+            headers=SUPABASE_SERVICE_HEADERS,
+            timeout=20,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    try:
+        data = await asyncio.to_thread(_create_signed_upload_url)
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Не удалось создать ссылку для загрузки: {e}")
+
+    signed_path = data.get("url")  # вида "/object/upload/sign/{bucket}/{path}?token=..."
+    if not signed_path:
+        raise HTTPException(status_code=502, detail=f"Supabase Storage не вернул ссылку: {data}")
+
+    return {
+        "bucket": LIPSYNC_UPLOAD_BUCKET,
+        "path": object_path,
+        "upload_url": f"{SUPABASE_STORAGE_URL}{signed_path}",
+    }
+
+
 @router.post("/photo-emotion")
 async def generate_photo_emotion(
     image: UploadFile = File(...),
@@ -339,22 +430,32 @@ async def generate_photo_text_emotion(
 
 @router.post("/lipsync")
 async def generate_lipsync(
-    video: UploadFile = File(...),
     audio: UploadFile = File(...),
+    video: UploadFile | None = File(None),
+    video_storage_bucket: str | None = Form(None),
+    video_storage_path: str | None = Form(None),
     user_id: str = Depends(get_current_user_id),
     db: Session = Depends(get_db),
 ):
     """Кейс 3: видео с лицом + аудио-драйвер → липсинк через MuseTalk 1.5.
-    Списывает баланс сразу — длительность известна по загруженному
-    аудио-драйверу."""
+    Видео теперь приходит НЕ файлом через это тело запроса, а уже лежит
+    в Supabase Storage (см. /upload-url) — сюда прилетают только его
+    координаты. Старый путь через UploadFile оставлен для совместимости."""
     request_id = uuid.uuid4().hex
-    video_path = os.path.join(TEMP_DIR, f"{request_id}_{video.filename}")
     audio_path = os.path.join(TEMP_DIR, f"{request_id}_{audio.filename}")
-
-    with open(video_path, "wb") as f:
-        f.write(await video.read())
     with open(audio_path, "wb") as f:
         f.write(await audio.read())
+
+    if video_storage_path:
+        bucket = video_storage_bucket or LIPSYNC_UPLOAD_BUCKET
+        video_path = os.path.join(TEMP_DIR, f"{request_id}_video.mp4")
+        await asyncio.to_thread(download_from_supabase_storage, bucket, video_storage_path, video_path)
+    elif video is not None:
+        video_path = os.path.join(TEMP_DIR, f"{request_id}_{video.filename}")
+        with open(video_path, "wb") as f:
+            f.write(await video.read())
+    else:
+        raise HTTPException(status_code=422, detail="Нужно передать video или video_storage_path")
 
     try:
         duration = get_media_duration_seconds(audio_path)
@@ -366,16 +467,22 @@ async def generate_lipsync(
         for p in (video_path, audio_path):
             if os.path.exists(p):
                 os.remove(p)
+        if video_storage_path:
+            await asyncio.to_thread(
+                delete_from_supabase_storage, video_storage_bucket or LIPSYNC_UPLOAD_BUCKET, video_storage_path
+            )
 
     return {"job_id": job_id, "status_url": f"/api/generate/status/{job_id}"}
 
 
 @router.post("/lipsync-from-text")
 async def generate_lipsync_from_text(
-    video: UploadFile = File(...),
     voice_sample: UploadFile = File(...),
     text: str = Form(...),
     language: str = Form("ru"),
+    video: UploadFile | None = File(None),
+    video_storage_bucket: str | None = Form(None),
+    video_storage_path: str | None = Form(None),
     user_id: str = Depends(get_current_user_id),
     db: Session = Depends(get_db),
 ):
@@ -384,6 +491,9 @@ async def generate_lipsync_from_text(
     по voice_sample, тот же движок, что в Кейсе 1), затем накладывает
     липсинк получившейся озвучки на исходное видео через MuseTalk.
 
+    Видео, как и в /lipsync, приходит через Supabase Storage-координаты,
+    а не файлом в теле запроса.
+
     Длительность и стоимость известны только после реальной озвучки —
     поэтому TTS-шаг выполняется синхронно внутри этого запроса (обычно
     5-20 секунд для короткого текста), баланс списывается сразу после
@@ -391,13 +501,21 @@ async def generate_lipsync_from_text(
     request_id = uuid.uuid4().hex
     work_dir = os.path.join(TEMP_DIR, request_id)
     os.makedirs(work_dir, exist_ok=True)
-    video_path = os.path.join(work_dir, f"video_{video.filename}")
     voice_path = os.path.join(work_dir, f"voice_{voice_sample.filename}")
-
-    with open(video_path, "wb") as f:
-        f.write(await video.read())
     with open(voice_path, "wb") as f:
         f.write(await voice_sample.read())
+
+    if video_storage_path:
+        bucket = video_storage_bucket or LIPSYNC_UPLOAD_BUCKET
+        video_path = os.path.join(work_dir, "video.mp4")
+        await asyncio.to_thread(download_from_supabase_storage, bucket, video_storage_path, video_path)
+    elif video is not None:
+        video_path = os.path.join(work_dir, f"video_{video.filename}")
+        with open(video_path, "wb") as f:
+            f.write(await video.read())
+    else:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise HTTPException(status_code=422, detail="Нужно передать video или video_storage_path")
 
     try:
         audio_path, duration = await asyncio.to_thread(
@@ -410,6 +528,10 @@ async def generate_lipsync_from_text(
         job_id = await asyncio.to_thread(submit_lipsync_job, video_path, audio_path)
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+        if video_storage_path:
+            await asyncio.to_thread(
+                delete_from_supabase_storage, video_storage_bucket or LIPSYNC_UPLOAD_BUCKET, video_storage_path
+            )
 
     return {"job_id": job_id, "status_url": f"/api/generate/status/{job_id}"}
 
@@ -469,62 +591,3 @@ async def get_job_status(job_id: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=502, detail=f"Генерация упала: {data}")
 
     return {"job_id": job_id, "status": status}
-
-
-@router.get("/debug/runpod-ping")
-async def debug_runpod_ping():
-    """Временный диагностический эндпоинт — см. историю чата. Можно
-    удалить, когда стабильность будет подтверждена окончательно."""
-    endpoints = {"sadtalker_xtts": RUNPOD_BASE_URL, "lipsync": RUNPOD_LIPSYNC_BASE_URL}
-    results = {}
-    for name, base_url in endpoints.items():
-        start = time.time()
-        try:
-            resp = await asyncio.to_thread(requests.get, f"{base_url}/health", headers=HEADERS, timeout=20)
-            elapsed = round(time.time() - start, 2)
-            try:
-                body = resp.json()
-            except Exception:
-                body = resp.text[:500]
-            results[name] = {"ok": True, "status_code": resp.status_code, "elapsed_sec": elapsed, "body": body}
-        except requests.exceptions.RequestException as e:
-            results[name] = {"ok": False, "elapsed_sec": round(time.time() - start, 2), "error": str(e)}
-    results["env_check"] = {
-        "runpod_api_key_set": bool(RUNPOD_API_KEY),
-        "runpod_endpoint_id_set": bool(RUNPOD_ENDPOINT_ID),
-        "runpod_lipsync_endpoint_id_set": bool(RUNPOD_LIPSYNC_ENDPOINT_ID),
-    }
-    return results
-
-
-@router.get("/debug/runpod-run-ping")
-async def debug_runpod_run_ping():
-    """Проверяет именно POST /run — см. историю чата."""
-    endpoints = {"sadtalker_xtts": RUNPOD_BASE_URL, "lipsync": RUNPOD_LIPSYNC_BASE_URL}
-    results = {}
-    for name, base_url in endpoints.items():
-        entry = {}
-        start = time.time()
-        try:
-            resp = await asyncio.to_thread(
-                requests.post, f"{base_url}/run", headers=HEADERS,
-                json={"input": {"healthcheck": True}}, timeout=30
-            )
-            entry["run_elapsed_sec"] = round(time.time() - start, 2)
-            resp.raise_for_status()
-            job = resp.json()
-            entry["run_status_code"] = resp.status_code
-            entry["run_response"] = job
-            job_id = job.get("id")
-            if job_id:
-                start2 = time.time()
-                status_resp = await asyncio.to_thread(
-                    requests.get, f"{base_url}/status/{job_id}", headers=HEADERS, timeout=20
-                )
-                entry["status_elapsed_sec"] = round(time.time() - start2, 2)
-                entry["status_response"] = status_resp.json()
-        except requests.exceptions.RequestException as e:
-            entry["error"] = str(e)
-            entry["elapsed_sec_before_error"] = round(time.time() - start, 2)
-        results[name] = entry
-    return results
