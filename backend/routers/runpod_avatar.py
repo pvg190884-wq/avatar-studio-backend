@@ -22,17 +22,9 @@ RUNPOD_ENDPOINT_ID = os.getenv("RUNPOD_ENDPOINT_ID")
 RUNPOD_API_KEY = os.getenv("RUNPOD_API_KEY")
 RUNPOD_BASE_URL = f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}"
 
-# Кейс 3 (MuseTalk-липсинк) живёт на отдельном RunPod Serverless
-# эндпоинте (Avatar-Studio-Lipsync), отдельном от SadTalker/XTTS
-# (Avatar-Studio). API-ключ общий, endpoint ID — свой.
 RUNPOD_LIPSYNC_ENDPOINT_ID = os.getenv("RUNPOD_LIPSYNC_ENDPOINT_ID")
 RUNPOD_LIPSYNC_BASE_URL = f"https://api.runpod.ai/v2/{RUNPOD_LIPSYNC_ENDPOINT_ID}"
 
-# Список user_id (из Supabase, тот же формат, что отдаёт
-# GET /api/billing/balance в поле "user_id"), для которых генерация
-# НЕ списывает баланс — например, твой собственный аккаунт для
-# тестирования. Задаётся через Railway Variables, через запятую:
-# UNLIMITED_USER_IDS=abc-123-...,def-456-...
 UNLIMITED_USER_IDS = {u.strip() for u in os.getenv("UNLIMITED_USER_IDS", "").split(",") if u.strip()}
 
 TEMP_DIR = "data/runpod_tmp"
@@ -47,23 +39,22 @@ HEADERS = {
     "Authorization": f"Bearer {RUNPOD_API_KEY}"
 }
 
-# Префикс, которым помечаются job_id, отправленные на lipsync-эндпоинт,
-# чтобы GET /status/{job_id} знал, к какому воркеру стучаться.
 LIPSYNC_PREFIX = "lipsync:"
 
-# Кейс 1 (текст -> TTS -> видео): длительность озвучки известна только
-# после реальной генерации, поэтому списание баланса откладывается до
-# момента получения готового видео в /status/{job_id}. Здесь храним,
-# какому пользователю принадлежит задача. ВАЖНО: это простое решение
-# "в памяти процесса" — при рестарте/редеплое Railway между отправкой
-# задачи и её завершением запись потеряется и списание для этой
-# конкретной задачи не произойдёт (редкий, но возможный случай).
+# Кейс 3 с текстом (TTS -> липсинк): раньше TTS-шаг выполнялся
+# синхронно внутри HTTP-запроса и иногда упирался в клиентский/прокси
+# таймаут на холодном RunPod-воркере (см. историю чата — коды 499
+# ровно на длительности клиентского таймаута). Теперь TTS + отправка
+# в MuseTalk выполняются в фоне; TEXT_LIPSYNC_JOBS отслеживает статус
+# такой фоновой задачи, пока она не превратится в обычный RunPod job_id
+# с префиксом lipsync: (см. _run_lipsync_from_text_job и get_job_status).
+TEXT_LIPSYNC_PREFIX = "textlipsync:"
+TEXT_LIPSYNC_JOBS: dict[str, dict] = {}
+
 JOB_OWNERS: dict[str, str] = {}
 
 
 def get_media_duration_seconds(path: str) -> float:
-    """Читает реальную длительность аудио/видео файла на диске через
-    mutagen — сервер не доверяет числам, которые прислал клиент."""
     media = MutagenFile(path)
     if media is None or media.info is None or not hasattr(media.info, "length"):
         raise HTTPException(status_code=422, detail="Не удалось определить длительность файла")
@@ -71,8 +62,6 @@ def get_media_duration_seconds(path: str) -> float:
 
 
 def charge_user(db: Session, user_id: str, cost: float):
-    """Списывает cost с баланса пользователя, если он не в списке
-    освобождённых от оплаты. Бросает 402, если средств не хватает."""
     if user_id in UNLIMITED_USER_IDS:
         return
     user = get_or_create_user(db, user_id)
@@ -83,21 +72,6 @@ def charge_user(db: Session, user_id: str, cost: float):
         )
     user.balance_usd -= cost
     db.commit()
-
-
-# ---------------------------------------------------------------------------
-# Важно: эндпоинты FastAPI ниже НЕ ждут завершения генерации внутри одного
-# HTTP-запроса. Railway (edge-прокси перед приложением) обрывает долгие
-# запросы своим собственным таймаутом независимо от кода приложения —
-# генерация видео (SadTalker + XTTS-v2 / MuseTalk) может занимать 5+ минут,
-# что превышает этот лимит. Поэтому используется схема submit → poll:
-#   1) POST /photo-text-emotion (или /photo-emotion, /lipsync) сразу
-#      отправляет задачу в RunPod и возвращает job_id — сам HTTP-запрос
-#      занимает секунды.
-#   2) Клиент опрашивает GET /status/{job_id} с любым интервалом, пока
-#      не получит готовое видео — каждый такой запрос тоже быстрый, так
-#      что Railway его не обрывает.
-# ---------------------------------------------------------------------------
 
 
 def submit_sadtalker_job(image_path: str, audio_path: str, expression_scale: float,
@@ -166,7 +140,6 @@ def submit_photo_text_emotion_job(image_path: str, voice_sample_path: str, text:
 
 
 def submit_lipsync_job(video_path: str, audio_path: str) -> str:
-    """Кейс 3: отдельный RunPod-эндпоинт (MuseTalk)."""
     if not RUNPOD_LIPSYNC_ENDPOINT_ID:
         raise HTTPException(
             status_code=500,
@@ -200,12 +173,11 @@ def submit_lipsync_job(video_path: str, audio_path: str) -> str:
 
 
 def poll_runpod_job_sync(base_url: str, job_id: str, timeout: float = 120, interval: float = 3) -> dict:
-    """Синхронно ждёт завершения RunPod-задачи, опрашивая /status в цикле.
-    Используется только для промежуточного шага TTS внутри Кейса 3 с
-    текстом — сам TTS обычно занимает 5-20 секунд для короткого текста,
-    так что короткое блокирующее ожидание внутри уже вынесенного в
-    отдельный поток вызова (asyncio.to_thread) приемлемо и не грозит
-    подвесить сервер, в отличие от долгой видео-генерации."""
+    """Синхронно ждёт завершения RunPod-задачи (TTS) — вызывается из
+    _run_lipsync_from_text_job через asyncio.to_thread, т.е. уже вне
+    event loop, так что этот таймаут больше не рискует упереться ни в
+    клиентский, ни в Railway-прокси таймаут — сам HTTP-запрос давно
+    закончился к этому моменту."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         resp = requests.get(f"{base_url}/status/{job_id}", headers=HEADERS, timeout=20)
@@ -221,10 +193,6 @@ def poll_runpod_job_sync(base_url: str, job_id: str, timeout: float = 120, inter
 
 
 def synthesize_tts_via_runpod(voice_sample_path: str, text: str, language: str, work_dir: str) -> tuple[str, float]:
-    """Шаг 1 для Кейса 3 с текстом вместо готового аудио: озвучивает
-    текст через SadTalker/XTTS-воркер в режиме tts_only (без генерации
-    видео — воркер просто возвращает audio_base64). Возвращает путь к
-    получившемуся .wav-файлу и его реальную длительность в секундах."""
     with open(voice_sample_path, "rb") as f:
         voice_b64 = base64.b64encode(f.read()).decode("utf-8")
 
@@ -260,6 +228,28 @@ def synthesize_tts_via_runpod(voice_sample_path: str, text: str, language: str, 
     return audio_path, duration
 
 
+async def _run_lipsync_from_text_job(internal_id: str, video_path: str, voice_path: str,
+                                      work_dir: str, text: str, language: str, user_id: str):
+    """Фоновая обработка Кейса 3 с текстом — TTS и отправка в MuseTalk,
+    полностью вне HTTP-запроса. Регистрирует результат в JOB_OWNERS
+    (тот же механизм отложенного списания, что уже используется в
+    Кейсе 1) — списание произойдёт при получении готового видео в
+    get_job_status, как обычно."""
+    try:
+        audio_path, duration = await asyncio.to_thread(
+            synthesize_tts_via_runpod, voice_path, text, language, work_dir
+        )
+        runpod_job_id = await asyncio.to_thread(submit_lipsync_job, video_path, audio_path)
+        JOB_OWNERS[runpod_job_id] = user_id
+        TEXT_LIPSYNC_JOBS[internal_id] = {"status": "SUBMITTED", "runpod_job_id": runpod_job_id, "error": None}
+    except HTTPException as e:
+        TEXT_LIPSYNC_JOBS[internal_id] = {"status": "FAILED", "runpod_job_id": None, "error": str(e.detail)}
+    except Exception as e:
+        TEXT_LIPSYNC_JOBS[internal_id] = {"status": "FAILED", "runpod_job_id": None, "error": str(e)}
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
 @router.post("/photo-emotion")
 async def generate_photo_emotion(
     image: UploadFile = File(...),
@@ -269,10 +259,6 @@ async def generate_photo_emotion(
     user_id: str = Depends(get_current_user_id),
     db: Session = Depends(get_db),
 ):
-    """Кейс 2: фото + аудио, модель сама подстраивает эмоции под голос.
-    Списывает баланс сразу — длительность известна по загруженному
-    аудио. Сразу возвращает job_id — результат забирается через
-    GET /status/{job_id}."""
     request_id = uuid.uuid4().hex
     image_path = os.path.join(TEMP_DIR, f"{request_id}_{image.filename}")
     audio_path = os.path.join(TEMP_DIR, f"{request_id}_{audio.filename}")
@@ -310,10 +296,6 @@ async def generate_photo_text_emotion(
     language: str = Form("ru"),
     user_id: str = Depends(get_current_user_id),
 ):
-    """Кейс 1: фото + образец голоса + текст + выбор эмоции. Длительность
-    озвучки известна только после реального TTS, поэтому списание
-    баланса откладывается до момента, когда видео будет готово (см.
-    /status/{job_id}). Сразу возвращает job_id."""
     request_id = uuid.uuid4().hex
     image_path = os.path.join(TEMP_DIR, f"{request_id}_{image.filename}")
     voice_path = os.path.join(TEMP_DIR, f"{request_id}_{voice_sample.filename}")
@@ -344,9 +326,6 @@ async def generate_lipsync(
     user_id: str = Depends(get_current_user_id),
     db: Session = Depends(get_db),
 ):
-    """Кейс 3: видео с лицом + аудио-драйвер → липсинк через MuseTalk 1.5.
-    Списывает баланс сразу — длительность известна по загруженному
-    аудио-драйверу."""
     request_id = uuid.uuid4().hex
     video_path = os.path.join(TEMP_DIR, f"{request_id}_{video.filename}")
     audio_path = os.path.join(TEMP_DIR, f"{request_id}_{audio.filename}")
@@ -377,17 +356,27 @@ async def generate_lipsync_from_text(
     text: str = Form(...),
     language: str = Form("ru"),
     user_id: str = Depends(get_current_user_id),
-    db: Session = Depends(get_db),
 ):
-    """Кейс 3 с текстом вместо готового аудио: сначала озвучивает текст
-    через SadTalker/XTTS-воркер в режиме tts_only (клонирование голоса
-    по voice_sample, тот же движок, что в Кейсе 1), затем накладывает
-    липсинк получившейся озвучки на исходное видео через MuseTalk.
+    """Кейс 3 с текстом вместо готового аудио: озвучивает текст через
+    SadTalker/XTTS-воркер (tts_only), затем отправляет липсинк-задачу
+    в MuseTalk.
 
-    Длительность и стоимость известны только после реальной озвучки —
-    поэтому TTS-шаг выполняется синхронно внутри этого запроса (обычно
-    5-20 секунд для короткого текста), баланс списывается сразу после
-    него и ДО отправки более дорогой финальной задачи в очередь."""
+    ВАЖНО: переписано под тот же submit→poll паттерн, что и все
+    остальные эндпоинты — раньше TTS-шаг выполнялся синхронно внутри
+    этого HTTP-запроса, из-за чего на холодном/перегруженном
+    SadTalker/XTTS-воркере суммарное время иногда превышало и наш
+    собственный клиентский таймаут, и рисковало упереться в таймаут
+    прокси Railway — оба раза с одной и той же картиной: запрос
+    обрывается уже после того, как всё фактически успешно случилось
+    на сервере (см. историю чата: коды 499 "client closed request"
+    ровно на длительности клиентского таймаута — это наш же frontend,
+    а не сетевой сбой).
+
+    Теперь TTS и отправка задачи выполняются в фоне — сам HTTP-запрос
+    возвращается за доли секунды с временным job_id (префикс
+    textlipsync:). Списание баланса теперь ОТЛОЖЕНО до готового видео
+    (тот же механизм JOB_OWNERS, что уже в Кейсе 1) — раньше
+    списывалось сразу после TTS-шага, ДО завершения HTTP-запроса."""
     request_id = uuid.uuid4().hex
     work_dir = os.path.join(TEMP_DIR, request_id)
     os.makedirs(work_dir, exist_ok=True)
@@ -399,18 +388,14 @@ async def generate_lipsync_from_text(
     with open(voice_path, "wb") as f:
         f.write(await voice_sample.read())
 
-    try:
-        audio_path, duration = await asyncio.to_thread(
-            synthesize_tts_via_runpod, voice_path, text, language, work_dir
-        )
+    internal_id = uuid.uuid4().hex
+    TEXT_LIPSYNC_JOBS[internal_id] = {"status": "PENDING", "runpod_job_id": None, "error": None}
 
-        cost = calculate_generation_cost(duration)
-        charge_user(db, user_id, cost)
+    asyncio.create_task(
+        _run_lipsync_from_text_job(internal_id, video_path, voice_path, work_dir, text, language, user_id)
+    )
 
-        job_id = await asyncio.to_thread(submit_lipsync_job, video_path, audio_path)
-    finally:
-        shutil.rmtree(work_dir, ignore_errors=True)
-
+    job_id = f"{TEXT_LIPSYNC_PREFIX}{internal_id}"
     return {"job_id": job_id, "status_url": f"/api/generate/status/{job_id}"}
 
 
@@ -418,9 +403,26 @@ async def generate_lipsync_from_text(
 async def get_job_status(job_id: str, db: Session = Depends(get_db)):
     """Опрашивается клиентом до тех пор, пока генерация не завершится.
 
-    job_id с префиксом "lipsync:" направляется на RunPod-эндпоинт Кейса 3
-    (MuseTalk), все остальные — на основной эндпоинт (SadTalker/XTTS,
+    job_id с префиксом "textlipsync:" — фоновая задача Кейса 3 с
+    текстом, ещё не превратившаяся в реальный RunPod job_id (см.
+    _run_lipsync_from_text_job); "lipsync:" — реальный эндпоинт Кейса 3
+    (MuseTalk); всё остальное — основной эндпоинт (SadTalker/XTTS,
     Кейсы 1 и 2)."""
+    if job_id.startswith(TEXT_LIPSYNC_PREFIX):
+        internal_id = job_id[len(TEXT_LIPSYNC_PREFIX):]
+        entry = TEXT_LIPSYNC_JOBS.get(internal_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Задача не найдена (возможно, сервер перезапускался)")
+        if entry["status"] == "PENDING":
+            return {"job_id": job_id, "status": "PENDING"}
+        if entry["status"] == "FAILED":
+            raise HTTPException(status_code=502, detail=f"Генерация упала: {entry['error']}")
+        # SUBMITTED — дальше работаем с реальным RunPod job_id как обычно.
+        # Запись НЕ удаляем из TEXT_LIPSYNC_JOBS: клиент продолжает
+        # опрашивать этот же исходный job_id на каждом последующем
+        # запросе, так что резолвить префикс нужно уметь многократно.
+        job_id = entry["runpod_job_id"]
+
     if job_id.startswith(LIPSYNC_PREFIX):
         raw_job_id = job_id[len(LIPSYNC_PREFIX):]
         base_url = RUNPOD_LIPSYNC_BASE_URL
@@ -436,9 +438,6 @@ async def get_job_status(job_id: str, db: Session = Depends(get_db)):
     if status == "COMPLETED":
         video_b64 = data["output"]["video_base64"]
         out_path = os.path.join(OUTPUT_DIR, f"{raw_job_id}.mp4")
-        # Идемпотентность: если файл уже записан (повторный опрос статуса
-        # после завершения), не перезаписываем и, что важнее, НЕ списываем
-        # баланс повторно за ту же задачу.
         first_time = not os.path.exists(out_path)
 
         if first_time:
@@ -448,8 +447,6 @@ async def get_job_status(job_id: str, db: Session = Depends(get_db)):
 
             await asyncio.to_thread(_write_video)
 
-            # Отложенное списание для Кейса 1 (текст -> TTS) — длительность
-            # известна только сейчас, по факту готового видео.
             owner_user_id = JOB_OWNERS.pop(job_id, None)
             if owner_user_id:
                 try:
@@ -459,8 +456,6 @@ async def get_job_status(job_id: str, db: Session = Depends(get_db)):
                 except HTTPException:
                     raise
                 except Exception as e:
-                    # Не блокируем выдачу готового видео из-за сбоя биллинга —
-                    # просто логируем, разберёмся постфактум.
                     print(f"Не удалось списать средства за задачу {job_id}: {e}")
 
         return FileResponse(out_path, media_type="video/mp4", filename="avatar_result.mp4")
