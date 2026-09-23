@@ -29,6 +29,7 @@ import os
 import json
 import hmac
 import hashlib
+import asyncio
 import requests
 from datetime import datetime
 from fastapi import APIRouter, HTTPException, Depends, Request
@@ -229,6 +230,16 @@ def verify_crypto_pay_signature(raw_body: bytes, signature_header: str) -> bool:
 
 
 def send_telegram_message(chat_id: str, text: str):
+    """ВАЖНО: это синхронная блокирующая функция (requests.post). Она
+    ДОЛЖНА вызываться только через asyncio.to_thread() из async-кода —
+    иначе, пока Telegram API отвечает (вплоть до timeout=10 секунд),
+    единственный поток event loop FastAPI полностью замирает, и сервер
+    перестаёт отвечать вообще на ВСЕ запросы от ВСЕХ пользователей, а
+    не только на этот один (тот же класс бага, что раньше уже был
+    найден и исправлен в runpod_avatar.py для вызовов RunPod — здесь
+    он был пропущен). См. историю чата: именно это вызвало 10-минутное
+    зависание заявки СБП и одновременный сбой у другого пользователя,
+    никак не связанного с СБП."""
     if not TELEGRAM_BOT_TOKEN or not chat_id:
         print("TELEGRAM_BOT_TOKEN/ADMIN_TELEGRAM_CHAT_ID не настроены — уведомление не отправлено")
         return
@@ -367,7 +378,11 @@ async def sbp_request(
     """Клиент выбрал способ оплаты СБП -> создаётся заявка 'pending' ->
     фронтенд показывает номер телефона (SBP_PHONE). Админу мгновенно
     приходит уведомление в Telegram со ссылкой на подтверждение в один
-    клик (см. /sbp/confirm-link) — без Swagger/curl."""
+    клик (см. /sbp/confirm-link) — без Swagger/curl.
+
+    Уведомление отправляется через asyncio.to_thread — см. подробный
+    комментарий у send_telegram_message() про то, почему синхронный
+    requests.post() здесь НЕЛЬЗЯ вызывать напрямую."""
     get_or_create_user(db, user_id)
 
     deposit = Deposit(
@@ -380,7 +395,7 @@ async def sbp_request(
     db.commit()
     db.refresh(deposit)
 
-    notify_admin_new_sbp_request(deposit.id, req.amount_rub, user_id)
+    await asyncio.to_thread(notify_admin_new_sbp_request, deposit.id, req.amount_rub, user_id)
 
     return {
         "deposit_id": deposit.id,
