@@ -6,6 +6,7 @@ import uuid
 import shutil
 import asyncio
 import requests
+from typing import Optional
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
@@ -25,12 +26,20 @@ RUNPOD_BASE_URL = f"https://api.runpod.ai/v2/{RUNPOD_ENDPOINT_ID}"
 RUNPOD_LIPSYNC_ENDPOINT_ID = os.getenv("RUNPOD_LIPSYNC_ENDPOINT_ID")
 RUNPOD_LIPSYNC_BASE_URL = f"https://api.runpod.ai/v2/{RUNPOD_LIPSYNC_ENDPOINT_ID}"
 
+# Pro-тир Кейсов 1 и 2 — отдельный RunPod-эндпоинт на EchoMimicV2
+# (репозиторий Avatar-Studio-EchoMimic). Не путать с RUNPOD_ENDPOINT_ID
+# (SadTalker/XTTS, Basic-тир) и RUNPOD_LIPSYNC_ENDPOINT_ID (MuseTalk, Кейс 3).
+RUNPOD_ECHOMIMIC_ENDPOINT_ID = os.getenv("RUNPOD_ECHOMIMIC_ENDPOINT_ID")
+RUNPOD_ECHOMIMIC_BASE_URL = f"https://api.runpod.ai/v2/{RUNPOD_ECHOMIMIC_ENDPOINT_ID}"
+
 UNLIMITED_USER_IDS = {u.strip() for u in os.getenv("UNLIMITED_USER_IDS", "").split(",") if u.strip()}
 
 TEMP_DIR = "data/runpod_tmp"
 OUTPUT_DIR = "data/outputs"
 os.makedirs(TEMP_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+MAX_CLIP_SECONDS = 15  # то же ограничение, что и во фронтенде (api.js)
 
 router = APIRouter(prefix="/api/generate", tags=["avatar-generation"])
 
@@ -50,6 +59,20 @@ LIPSYNC_PREFIX = "lipsync:"
 # с префиксом lipsync: (см. _run_lipsync_from_text_job и get_job_status).
 TEXT_LIPSYNC_PREFIX = "textlipsync:"
 TEXT_LIPSYNC_JOBS: dict[str, dict] = {}
+
+# Pro-тир Кейса 1 (фото + текст + голос + эмоция, EchoMimicV2): та же
+# идея, что и у Кейса 3 text-mode выше — TTS должен отработать ДО
+# отправки в EchoMimic, поэтому это тоже фоновая задача с временным
+# job_id, пока не превратится в реальный RunPod job_id с префиксом
+# echomimic: (см. _run_case1_pro_job и get_job_status).
+ECHOMIMIC_PRO_TEXT_PREFIX = "echomimicpro:"
+ECHOMIMIC_PRO_TEXT_JOBS: dict[str, dict] = {}
+
+# Pro-тир Кейса 2 (фото + готовое аудио, EchoMimicV2) отправляется в
+# EchoMimic-воркер напрямую, без промежуточного TTS-шага — поэтому
+# отдельный фоновый JOBS-словарь ему не нужен, только префикс для
+# маршрутизации опроса статуса на правильный RunPod-эндпоинт.
+ECHOMIMIC_PREFIX = "echomimic:"
 
 JOB_OWNERS: dict[str, str] = {}
 
@@ -172,12 +195,50 @@ def submit_lipsync_job(video_path: str, audio_path: str) -> str:
     return f"{LIPSYNC_PREFIX}{raw_job_id}"
 
 
+def submit_echomimic_job(image_path: str, audio_path: str, emotion: Optional[str] = None) -> str:
+    """Pro-тир Кейсов 1 и 2 — EchoMimicV2-воркер. emotion=None означает
+    'определи эмоцию сам по аудио' (Кейс 2 Pro, см. handler.py в
+    Avatar-Studio-EchoMimic); для Кейса 1 Pro emotion всегда передаётся
+    явно (пользователь выбрал её в UI)."""
+    if not RUNPOD_ECHOMIMIC_ENDPOINT_ID:
+        raise HTTPException(
+            status_code=500,
+            detail="RUNPOD_ECHOMIMIC_ENDPOINT_ID не задан на сервере — проверь переменные окружения Railway"
+        )
+
+    with open(image_path, "rb") as f:
+        img_b64 = base64.b64encode(f.read()).decode("utf-8")
+    with open(audio_path, "rb") as f:
+        audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    payload_input = {
+        "image_base64": img_b64,
+        "audio_base64": audio_b64,
+        "max_seconds": MAX_CLIP_SECONDS,
+    }
+    if emotion:
+        payload_input["emotion"] = emotion
+
+    try:
+        resp = requests.post(f"{RUNPOD_ECHOMIMIC_BASE_URL}/run", headers=HEADERS, json={"input": payload_input}, timeout=30)
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Не удалось связаться с RunPod (EchoMimic): {e}")
+
+    job = resp.json()
+    raw_job_id = job.get("id")
+    if not raw_job_id:
+        raise HTTPException(status_code=502, detail=f"RunPod (EchoMimic) не вернул id задачи: {job}")
+
+    return f"{ECHOMIMIC_PREFIX}{raw_job_id}"
+
+
 def poll_runpod_job_sync(base_url: str, job_id: str, timeout: float = 120, interval: float = 3) -> dict:
     """Синхронно ждёт завершения RunPod-задачи (TTS) — вызывается из
-    _run_lipsync_from_text_job через asyncio.to_thread, т.е. уже вне
-    event loop, так что этот таймаут больше не рискует упереться ни в
-    клиентский, ни в Railway-прокси таймаут — сам HTTP-запрос давно
-    закончился к этому моменту."""
+    _run_lipsync_from_text_job/_run_case1_pro_job через asyncio.to_thread,
+    т.е. уже вне event loop, так что этот таймаут больше не рискует
+    упереться ни в клиентский, ни в Railway-прокси таймаут — сам
+    HTTP-запрос давно закончился к этому моменту."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         resp = requests.get(f"{base_url}/status/{job_id}", headers=HEADERS, timeout=20)
@@ -250,15 +311,45 @@ async def _run_lipsync_from_text_job(internal_id: str, video_path: str, voice_pa
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+async def _run_case1_pro_job(internal_id: str, image_path: str, voice_path: str,
+                              work_dir: str, text: str, emotion: str, language: str, user_id: str):
+    """Фоновая обработка Кейса 1 Pro — сначала озвучка текста через
+    существующий SadTalker/XTTS-воркер (tts_only, та же функция
+    synthesize_tts_via_runpod, что и у Кейса 3 text-mode — TTS-логику
+    не дублируем), затем готовое аудио вместе с фото и явно выбранной
+    пользователем эмоцией уходит в EchoMimic-воркер. Тот же паттерн
+    фоновой задачи, что и у _run_lipsync_from_text_job выше."""
+    try:
+        audio_path, duration = await asyncio.to_thread(
+            synthesize_tts_via_runpod, voice_path, text, language, work_dir
+        )
+        runpod_job_id = await asyncio.to_thread(submit_echomimic_job, image_path, audio_path, emotion)
+        JOB_OWNERS[runpod_job_id] = user_id
+        ECHOMIMIC_PRO_TEXT_JOBS[internal_id] = {"status": "SUBMITTED", "runpod_job_id": runpod_job_id, "error": None}
+    except HTTPException as e:
+        ECHOMIMIC_PRO_TEXT_JOBS[internal_id] = {"status": "FAILED", "runpod_job_id": None, "error": str(e.detail)}
+    except Exception as e:
+        ECHOMIMIC_PRO_TEXT_JOBS[internal_id] = {"status": "FAILED", "runpod_job_id": None, "error": str(e)}
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
 @router.post("/photo-emotion")
 async def generate_photo_emotion(
     image: UploadFile = File(...),
     audio: UploadFile = File(...),
     expression_scale: float = Form(0.7),
     pose_style: int = Form(0),
+    tier: str = Form("basic"),
     user_id: str = Depends(get_current_user_id),
     db: Session = Depends(get_db),
 ):
+    """Кейс 2. tier="pro" отправляет в EchoMimic-воркер вместо
+    SadTalker — эмоция не передаётся явно, EchoMimic сам определит её
+    по тону аудио (см. handler.py, detect_emotion_from_audio).
+    expression_scale/pose_style в Pro-режиме не используются (это
+    параметры SadTalker), но по-прежнему принимаются с фронтенда без
+    ошибки, чтобы не усложнять форму."""
     request_id = uuid.uuid4().hex
     image_path = os.path.join(TEMP_DIR, f"{request_id}_{image.filename}")
     audio_path = os.path.join(TEMP_DIR, f"{request_id}_{audio.filename}")
@@ -273,12 +364,15 @@ async def generate_photo_emotion(
         cost = calculate_generation_cost(duration)
         charge_user(db, user_id, cost)
 
-        job_id = await asyncio.to_thread(
-            submit_sadtalker_job,
-            image_path, audio_path,
-            expression_scale=expression_scale,
-            pose_style=pose_style
-        )
+        if tier == "pro":
+            job_id = await asyncio.to_thread(submit_echomimic_job, image_path, audio_path, None)
+        else:
+            job_id = await asyncio.to_thread(
+                submit_sadtalker_job,
+                image_path, audio_path,
+                expression_scale=expression_scale,
+                pose_style=pose_style
+            )
     finally:
         for p in (image_path, audio_path):
             if os.path.exists(p):
@@ -294,8 +388,39 @@ async def generate_photo_text_emotion(
     text: str = Form(...),
     emotion: str = Form("neutral"),
     language: str = Form("ru"),
+    tier: str = Form("basic"),
     user_id: str = Depends(get_current_user_id),
 ):
+    """Кейс 1. tier="basic" — прежнее поведение без изменений (один
+    синхронный вызов SadTalker/XTTS-воркера, который делает TTS и
+    видео вместе). tier="pro" — фоновая задача: сначала TTS через тот
+    же SadTalker/XTTS-воркер (tts_only), затем EchoMimic с явно
+    выбранной эмоцией; списание баланса в Pro-режиме отложено до
+    готового видео (тот же механизм JOB_OWNERS, что и у Кейса 3
+    text-mode), т.к. точная стоимость известна только после TTS."""
+    if tier == "pro":
+        request_id = uuid.uuid4().hex
+        work_dir = os.path.join(TEMP_DIR, request_id)
+        os.makedirs(work_dir, exist_ok=True)
+        image_path = os.path.join(work_dir, f"image_{image.filename}")
+        voice_path = os.path.join(work_dir, f"voice_{voice_sample.filename}")
+
+        with open(image_path, "wb") as f:
+            f.write(await image.read())
+        with open(voice_path, "wb") as f:
+            f.write(await voice_sample.read())
+
+        internal_id = uuid.uuid4().hex
+        ECHOMIMIC_PRO_TEXT_JOBS[internal_id] = {"status": "PENDING", "runpod_job_id": None, "error": None}
+
+        asyncio.create_task(
+            _run_case1_pro_job(internal_id, image_path, voice_path, work_dir, text, emotion, language, user_id)
+        )
+
+        job_id = f"{ECHOMIMIC_PRO_TEXT_PREFIX}{internal_id}"
+        return {"job_id": job_id, "status_url": f"/api/generate/status/{job_id}"}
+
+    # ------- tier="basic": прежнее поведение без изменений -------
     request_id = uuid.uuid4().hex
     image_path = os.path.join(TEMP_DIR, f"{request_id}_{image.filename}")
     voice_path = os.path.join(TEMP_DIR, f"{request_id}_{voice_sample.filename}")
@@ -403,11 +528,12 @@ async def generate_lipsync_from_text(
 async def get_job_status(job_id: str, db: Session = Depends(get_db)):
     """Опрашивается клиентом до тех пор, пока генерация не завершится.
 
-    job_id с префиксом "textlipsync:" — фоновая задача Кейса 3 с
-    текстом, ещё не превратившаяся в реальный RunPod job_id (см.
-    _run_lipsync_from_text_job); "lipsync:" — реальный эндпоинт Кейса 3
-    (MuseTalk); всё остальное — основной эндпоинт (SadTalker/XTTS,
-    Кейсы 1 и 2)."""
+    job_id с префиксом "textlipsync:" или "echomimicpro:" — фоновые
+    задачи (TTS ещё не завершился, реального RunPod job_id пока нет,
+    см. _run_lipsync_from_text_job / _run_case1_pro_job); "lipsync:" —
+    MuseTalk (Кейс 3 basic); "echomimic:" — EchoMimicV2 (Pro-тир
+    Кейсов 1 и 2); всё остальное — основной эндпоинт (SadTalker/XTTS,
+    Кейсы 1 и 2 Basic)."""
     if job_id.startswith(TEXT_LIPSYNC_PREFIX):
         internal_id = job_id[len(TEXT_LIPSYNC_PREFIX):]
         entry = TEXT_LIPSYNC_JOBS.get(internal_id)
@@ -423,9 +549,23 @@ async def get_job_status(job_id: str, db: Session = Depends(get_db)):
         # запросе, так что резолвить префикс нужно уметь многократно.
         job_id = entry["runpod_job_id"]
 
+    if job_id.startswith(ECHOMIMIC_PRO_TEXT_PREFIX):
+        internal_id = job_id[len(ECHOMIMIC_PRO_TEXT_PREFIX):]
+        entry = ECHOMIMIC_PRO_TEXT_JOBS.get(internal_id)
+        if entry is None:
+            raise HTTPException(status_code=404, detail="Задача не найдена (возможно, сервер перезапускался)")
+        if entry["status"] == "PENDING":
+            return {"job_id": job_id, "status": "PENDING"}
+        if entry["status"] == "FAILED":
+            raise HTTPException(status_code=502, detail=f"Генерация упала: {entry['error']}")
+        job_id = entry["runpod_job_id"]
+
     if job_id.startswith(LIPSYNC_PREFIX):
         raw_job_id = job_id[len(LIPSYNC_PREFIX):]
         base_url = RUNPOD_LIPSYNC_BASE_URL
+    elif job_id.startswith(ECHOMIMIC_PREFIX):
+        raw_job_id = job_id[len(ECHOMIMIC_PREFIX):]
+        base_url = RUNPOD_ECHOMIMIC_BASE_URL
     else:
         raw_job_id = job_id
         base_url = RUNPOD_BASE_URL
