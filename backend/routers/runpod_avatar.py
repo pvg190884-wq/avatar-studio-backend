@@ -32,6 +32,16 @@ RUNPOD_LIPSYNC_BASE_URL = f"https://api.runpod.ai/v2/{RUNPOD_LIPSYNC_ENDPOINT_ID
 RUNPOD_ECHOMIMIC_ENDPOINT_ID = os.getenv("RUNPOD_ECHOMIMIC_ENDPOINT_ID")
 RUNPOD_ECHOMIMIC_BASE_URL = f"https://api.runpod.ai/v2/{RUNPOD_ECHOMIMIC_ENDPOINT_ID}"
 
+# Pro-тир Кейсов 1 и 2 — ЗАМЕНА EchoMimicV2 на LongCat-Video-Avatar 1.5
+# после того, как EchoMimicV2 был признан неприемлемым по качеству для
+# коммерческого продукта (сильные искажения лица/пропорций даже на
+# самом спокойном pose-шаблоне, не чинится дальнейшей настройкой —
+# см. историю чата). Инфраструктура EchoMimic (переменные и функция
+# выше/ниже) оставлена в коде нетронутой на случай пересмотра, но
+# больше не используется ни в одном активном маршруте.
+RUNPOD_LONGCAT_ENDPOINT_ID = os.getenv("RUNPOD_LONGCAT_ENDPOINT_ID")
+RUNPOD_LONGCAT_BASE_URL = f"https://api.runpod.ai/v2/{RUNPOD_LONGCAT_ENDPOINT_ID}"
+
 UNLIMITED_USER_IDS = {u.strip() for u in os.getenv("UNLIMITED_USER_IDS", "").split(",") if u.strip()}
 
 TEMP_DIR = "data/runpod_tmp"
@@ -73,6 +83,9 @@ ECHOMIMIC_PRO_TEXT_JOBS: dict[str, dict] = {}
 # отдельный фоновый JOBS-словарь ему не нужен, только префикс для
 # маршрутизации опроса статуса на правильный RunPod-эндпоинт.
 ECHOMIMIC_PREFIX = "echomimic:"
+
+# Активный Pro-движок (см. комментарий у RUNPOD_LONGCAT_ENDPOINT_ID выше).
+LONGCAT_PREFIX = "longcat:"
 
 JOB_OWNERS: dict[str, str] = {}
 
@@ -233,6 +246,43 @@ def submit_echomimic_job(image_path: str, audio_path: str, emotion: Optional[str
     return f"{ECHOMIMIC_PREFIX}{raw_job_id}"
 
 
+def submit_longcat_job(image_path: str, audio_path: str, emotion: Optional[str] = None) -> str:
+    """Активный Pro-тир Кейсов 1 и 2 — LongCat-Video-Avatar 1.5
+    (см. Avatar-Studio-LongCat). emotion передаётся как есть (или None
+    для нейтрального дефолта) — воркер сам превращает её в текстовый
+    промпт, стиля pose-библиотек, как у EchoMimic, здесь нет."""
+    if not RUNPOD_LONGCAT_ENDPOINT_ID:
+        raise HTTPException(
+            status_code=500,
+            detail="RUNPOD_LONGCAT_ENDPOINT_ID не задан на сервере — проверь переменные окружения Railway"
+        )
+
+    with open(image_path, "rb") as f:
+        img_b64 = base64.b64encode(f.read()).decode("utf-8")
+    with open(audio_path, "rb") as f:
+        audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    payload_input = {
+        "image_base64": img_b64,
+        "audio_base64": audio_b64,
+    }
+    if emotion:
+        payload_input["emotion"] = emotion
+
+    try:
+        resp = requests.post(f"{RUNPOD_LONGCAT_BASE_URL}/run", headers=HEADERS, json={"input": payload_input}, timeout=30)
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Не удалось связаться с RunPod (LongCat): {e}")
+
+    job = resp.json()
+    raw_job_id = job.get("id")
+    if not raw_job_id:
+        raise HTTPException(status_code=502, detail=f"RunPod (LongCat) не вернул id задачи: {job}")
+
+    return f"{LONGCAT_PREFIX}{raw_job_id}"
+
+
 def poll_runpod_job_sync(base_url: str, job_id: str, timeout: float = 120, interval: float = 3) -> dict:
     """Синхронно ждёт завершения RunPod-задачи (TTS) — вызывается из
     _run_lipsync_from_text_job/_run_case1_pro_job через asyncio.to_thread,
@@ -323,7 +373,7 @@ async def _run_case1_pro_job(internal_id: str, image_path: str, voice_path: str,
         audio_path, duration = await asyncio.to_thread(
             synthesize_tts_via_runpod, voice_path, text, language, work_dir
         )
-        runpod_job_id = await asyncio.to_thread(submit_echomimic_job, image_path, audio_path, emotion)
+        runpod_job_id = await asyncio.to_thread(submit_longcat_job, image_path, audio_path, emotion)
         JOB_OWNERS[runpod_job_id] = user_id
         ECHOMIMIC_PRO_TEXT_JOBS[internal_id] = {"status": "SUBMITTED", "runpod_job_id": runpod_job_id, "error": None}
     except HTTPException as e:
@@ -365,7 +415,7 @@ async def generate_photo_emotion(
         charge_user(db, user_id, cost)
 
         if tier == "pro":
-            job_id = await asyncio.to_thread(submit_echomimic_job, image_path, audio_path, None)
+            job_id = await asyncio.to_thread(submit_longcat_job, image_path, audio_path, None)
         else:
             job_id = await asyncio.to_thread(
                 submit_sadtalker_job,
@@ -566,6 +616,9 @@ async def get_job_status(job_id: str, db: Session = Depends(get_db)):
     elif job_id.startswith(ECHOMIMIC_PREFIX):
         raw_job_id = job_id[len(ECHOMIMIC_PREFIX):]
         base_url = RUNPOD_ECHOMIMIC_BASE_URL
+    elif job_id.startswith(LONGCAT_PREFIX):
+        raw_job_id = job_id[len(LONGCAT_PREFIX):]
+        base_url = RUNPOD_LONGCAT_BASE_URL
     else:
         raw_job_id = job_id
         base_url = RUNPOD_BASE_URL
