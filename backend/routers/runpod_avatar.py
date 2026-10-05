@@ -90,6 +90,20 @@ LONGCAT_PREFIX = "longcat:"
 PRO_EMOTIONS = {"neutral", "angry", "happy", "sad"}
 
 JOB_OWNERS: dict[str, str] = {}
+# Цена, озвученная клиенту при отправке (Кейс 2): списываем именно её, когда
+# видео готово. Ключ — тот же job_id, что и в JOB_OWNERS.
+JOB_COSTS: dict[str, float] = {}
+# Когда впервые увидели задачу в статусе IN_QUEUE (для отмены долгого ожидания GPU).
+JOB_FIRST_SEEN: dict[str, float] = {}
+
+# Если задача ждёт свободную GPU дольше этого времени — отменяем её (деньги
+# не списываются, клиент видит понятное сообщение). Настраивается на Railway.
+QUEUE_WAIT_LIMIT_SECONDS = int(os.getenv("QUEUE_WAIT_LIMIT_SECONDS", "600"))
+# Общий срок жизни LongCat-задачи в RunPod (ожидание + выполнение), секунд.
+# Страховка для брошенных задач (клиент закрыл вкладку): без неё задача висит
+# 24 часа и может запуститься, когда она уже никому не нужна, — а GPU платная.
+# ВАЖНО: это жёсткий лимит, он должен покрывать и ожидание, и саму генерацию.
+LONGCAT_JOB_TTL_SECONDS = int(os.getenv("LONGCAT_JOB_TTL_SECONDS", "3600"))
 
 
 def get_media_duration_seconds(path: str) -> float:
@@ -110,6 +124,19 @@ def charge_user(db: Session, user_id: str, cost: float):
         )
     user.balance_usd -= cost
     db.commit()
+
+
+def ensure_balance(db: Session, user_id: str, cost: float):
+    """Проверяет, что на балансе хватает денег, НО ничего не списывает.
+    Списание происходит позже — когда видео готово (см. get_job_status)."""
+    if user_id in UNLIMITED_USER_IDS:
+        return
+    user = get_or_create_user(db, user_id)
+    if user.balance_usd < cost:
+        raise HTTPException(
+            status_code=402,
+            detail=f"Недостаточно средств: нужно ${cost:.4f}, на балансе ${user.balance_usd:.4f}"
+        )
 
 
 def submit_sadtalker_job(image_path: str, audio_path: str, expression_scale: float,
@@ -272,7 +299,11 @@ def submit_longcat_job(image_path: str, audio_path: str, emotion: Optional[str] 
         payload_input["emotion"] = emotion
 
     try:
-        resp = requests.post(f"{RUNPOD_LONGCAT_BASE_URL}/run", headers=HEADERS, json={"input": payload_input}, timeout=30)
+        resp = requests.post(
+            f"{RUNPOD_LONGCAT_BASE_URL}/run", headers=HEADERS,
+            json={"input": payload_input, "policy": {"ttl": LONGCAT_JOB_TTL_SECONDS * 1000}},
+            timeout=30,
+        )
         resp.raise_for_status()
     except requests.exceptions.RequestException as e:
         raise HTTPException(status_code=502, detail=f"Не удалось связаться с RunPod (LongCat): {e}")
@@ -415,7 +446,10 @@ async def generate_photo_emotion(
     try:
         duration = get_media_duration_seconds(audio_path)
         cost = calculate_generation_cost(duration, tier)
-        charge_user(db, user_id, cost)
+        # Защита средств клиента: заранее ТОЛЬКО проверяем баланс. Списываем
+        # после того, как видео готово и отдано (get_job_status) — при ошибке,
+        # OOM или отмене из-за нехватки GPU деньги остаются у клиента.
+        ensure_balance(db, user_id, cost)
 
         if tier == "pro":
             pro_emotion = emotion if emotion in PRO_EMOTIONS else "neutral"
@@ -432,6 +466,8 @@ async def generate_photo_emotion(
             if os.path.exists(p):
                 os.remove(p)
 
+    JOB_OWNERS[job_id] = user_id
+    JOB_COSTS[job_id] = cost
     return {"job_id": job_id, "status_url": f"/api/generate/status/{job_id}"}
 
 
@@ -444,6 +480,7 @@ async def generate_photo_text_emotion(
     language: str = Form("ru"),
     tier: str = Form("basic"),
     user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
 ):
     """Кейс 1. tier="basic" — прежнее поведение без изменений (один
     синхронный вызов SadTalker/XTTS-воркера, который делает TTS и
@@ -453,6 +490,9 @@ async def generate_photo_text_emotion(
     готового видео (тот же механизм JOB_OWNERS, что и у Кейса 3
     text-mode), т.к. точная стоимость известна только после TTS."""
     if tier == "pro":
+        # Минимальный порог: на балансе должно хватать хотя бы на один
+        # сегмент (~3.7 с) Pro-видео. Точная сумма — по готовому видео.
+        ensure_balance(db, user_id, calculate_generation_cost(3.72, "pro"))
         request_id = uuid.uuid4().hex
         work_dir = os.path.join(TEMP_DIR, request_id)
         os.makedirs(work_dir, exist_ok=True)
@@ -629,8 +669,36 @@ async def get_job_status(job_id: str, db: Session = Depends(get_db)):
 
     status_url = f"{base_url}/status/{raw_job_id}"
     status_resp = await asyncio.to_thread(requests.get, status_url, headers=HEADERS, timeout=30)
+
+    def _forget_job():
+        JOB_OWNERS.pop(job_id, None)
+        JOB_COSTS.pop(job_id, None)
+        JOB_FIRST_SEEN.pop(job_id, None)
+
+    # RunPod удаляет задачу по TTL — тогда статус отвечает 404.
+    if status_resp.status_code == 404:
+        _forget_job()
+        raise HTTPException(
+            status_code=504,
+            detail="Время ожидания задачи истекло. Деньги за неё не списаны — попробуйте ещё раз."
+        )
+
     data = status_resp.json()
     status = data.get("status")
+
+    # Долго ждём свободную GPU — отменяем задачу, деньги не списываются.
+    if status == "IN_QUEUE":
+        waited = time.time() - JOB_FIRST_SEEN.setdefault(job_id, time.time())
+        if waited > QUEUE_WAIT_LIMIT_SECONDS:
+            try:
+                await asyncio.to_thread(requests.post, f"{base_url}/cancel/{raw_job_id}", headers=HEADERS, timeout=30)
+            except requests.exceptions.RequestException as e:
+                print(f"Не удалось отменить задачу {job_id}: {e}")
+            _forget_job()
+            raise HTTPException(
+                status_code=503,
+                detail="Сейчас нет свободных видеокарт. Задача отменена, деньги не списаны — попробуйте через несколько минут."
+            )
 
     if status == "COMPLETED":
         video_b64 = data["output"]["video_base64"]
@@ -645,11 +713,17 @@ async def get_job_status(job_id: str, db: Session = Depends(get_db)):
             await asyncio.to_thread(_write_video)
 
             owner_user_id = JOB_OWNERS.pop(job_id, None)
+            quoted_cost = JOB_COSTS.pop(job_id, None)
+            JOB_FIRST_SEEN.pop(job_id, None)
             if owner_user_id:
                 try:
-                    actual_duration = get_media_duration_seconds(out_path)
-                    charge_tier = "pro" if job_id.startswith(LONGCAT_PREFIX) else "basic"
-                    cost = calculate_generation_cost(actual_duration, charge_tier)
+                    if quoted_cost is not None:
+                        # Кейс 2: списываем ровно ту сумму, что показали клиенту.
+                        cost = quoted_cost
+                    else:
+                        actual_duration = get_media_duration_seconds(out_path)
+                        charge_tier = "pro" if job_id.startswith(LONGCAT_PREFIX) else "basic"
+                        cost = calculate_generation_cost(actual_duration, charge_tier)
                     charge_user(db, owner_user_id, cost)
                 except HTTPException:
                     raise
@@ -658,7 +732,8 @@ async def get_job_status(job_id: str, db: Session = Depends(get_db)):
 
         return FileResponse(out_path, media_type="video/mp4", filename="avatar_result.mp4")
 
-    if status == "FAILED":
-        raise HTTPException(status_code=502, detail=f"Генерация упала: {data}")
+    if status in ("FAILED", "CANCELLED", "TIMED_OUT"):
+        _forget_job()
+        raise HTTPException(status_code=502, detail=f"Генерация упала: {data}. Деньги за неё не списаны.")
 
     return {"job_id": job_id, "status": status}
