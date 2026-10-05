@@ -75,6 +75,17 @@ MARKUP_COEFFICIENT = 1.5  # +50%
 #                   = 0.009 * 1.5 = $0.0135 за секунду.
 RUNPOD_COST_PER_SECOND_USD = 0.009
 
+# Pro (LongCat-Video-Avatar) — премиум-тариф: цена для клиента фиксированная,
+# БЕЗ наценки поверх RUNPOD_COST_PER_SECOND_USD (та относится к Basic).
+# $0.25 за секунду аудио. Если нужно поменять цену — меняется только это число
+# (и такое же число PRO_PRICE_PER_SECOND_USD во фронтенде, src/api.js —
+# оно используется только для текста-подсказки в интерфейсе).
+PRO_PRICE_PER_SECOND_USD = 0.25
+# Минимум секунд к оплате для Pro (по умолчанию 0 — отключено). Короткие ролики
+# невыгодны: GPU в любом случае считает минимум один сегмент (~3.7 с) и
+# загружает модель. Включается переменной окружения на Railway, например 4.
+PRO_MIN_BILLABLE_SECONDS = float(os.getenv("PRO_MIN_BILLABLE_SECONDS", "0"))
+
 # Курс для конвертации рублёвых СБП-пополнений в USD-баланс.
 # ВАЖНО: это фиксированное приближение, не биржевой курс в реальном
 # времени — обновляй вручную по мере необходимости, либо замени на
@@ -273,7 +284,10 @@ def notify_admin_new_sbp_request(deposit_id: int, amount_rub: float, user_id: st
     send_telegram_message(ADMIN_TELEGRAM_CHAT_ID, text)
 
 
-def calculate_generation_cost(duration_seconds: float) -> float:
+def calculate_generation_cost(duration_seconds: float, tier: str = "basic") -> float:
+    if tier == "pro":
+        billable = max(duration_seconds, PRO_MIN_BILLABLE_SECONDS)
+        return round(billable * PRO_PRICE_PER_SECOND_USD, 4)
     base_cost = duration_seconds * RUNPOD_COST_PER_SECOND_USD
     return round(base_cost * MARKUP_COEFFICIENT, 4)
 
@@ -476,9 +490,10 @@ async def get_balance(db: Session = Depends(get_db), user_id: str = Depends(get_
 
 
 @router.get("/estimate")
-async def estimate_cost(duration_seconds: float):
-    cost = calculate_generation_cost(duration_seconds)
+async def estimate_cost(duration_seconds: float, tier: str = "basic"):
+    cost = calculate_generation_cost(duration_seconds, tier)
     return {
         "duration_seconds": duration_seconds,
+        "tier": tier,
         "estimated_cost_usd": cost,
     }
