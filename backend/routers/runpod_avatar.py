@@ -86,6 +86,8 @@ ECHOMIMIC_PREFIX = "echomimic:"
 
 # Активный Pro-движок (см. комментарий у RUNPOD_LONGCAT_ENDPOINT_ID выше).
 LONGCAT_PREFIX = "longcat:"
+# Эмоции, доступные на форме Pro (ключи совпадают с библиотекой в handler.py LongCat).
+PRO_EMOTIONS = {"neutral", "angry", "happy", "sad"}
 
 JOB_OWNERS: dict[str, str] = {}
 
@@ -391,12 +393,13 @@ async def generate_photo_emotion(
     expression_scale: float = Form(0.7),
     pose_style: int = Form(0),
     tier: str = Form("basic"),
+    emotion: str = Form("neutral"),
     user_id: str = Depends(get_current_user_id),
     db: Session = Depends(get_db),
 ):
-    """Кейс 2. tier="pro" отправляет в EchoMimic-воркер вместо
-    SadTalker — эмоция не передаётся явно, EchoMimic сам определит её
-    по тону аудио (см. handler.py, detect_emotion_from_audio).
+    """Кейс 2. tier="pro" отправляет задачу в LongCat-Video-Avatar.
+    Эмоцию (neutral / angry / happy / sad) пользователь выбирает на
+    форме перед генерацией — воркер превращает её в текстовый промпт.
     expression_scale/pose_style в Pro-режиме не используются (это
     параметры SadTalker), но по-прежнему принимаются с фронтенда без
     ошибки, чтобы не усложнять форму."""
@@ -411,11 +414,12 @@ async def generate_photo_emotion(
 
     try:
         duration = get_media_duration_seconds(audio_path)
-        cost = calculate_generation_cost(duration)
+        cost = calculate_generation_cost(duration, tier)
         charge_user(db, user_id, cost)
 
         if tier == "pro":
-            job_id = await asyncio.to_thread(submit_longcat_job, image_path, audio_path, None)
+            pro_emotion = emotion if emotion in PRO_EMOTIONS else "neutral"
+            job_id = await asyncio.to_thread(submit_longcat_job, image_path, audio_path, pro_emotion)
         else:
             job_id = await asyncio.to_thread(
                 submit_sadtalker_job,
@@ -644,7 +648,8 @@ async def get_job_status(job_id: str, db: Session = Depends(get_db)):
             if owner_user_id:
                 try:
                     actual_duration = get_media_duration_seconds(out_path)
-                    cost = calculate_generation_cost(actual_duration)
+                    charge_tier = "pro" if job_id.startswith(LONGCAT_PREFIX) else "basic"
+                    cost = calculate_generation_cost(actual_duration, charge_tier)
                     charge_user(db, owner_user_id, cost)
                 except HTTPException:
                     raise
