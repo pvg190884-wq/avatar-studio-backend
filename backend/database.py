@@ -46,6 +46,21 @@ class Deposit(Base):
     confirmed_at = Column(DateTime, nullable=True)
 
 
+class Charge(Base):
+    """Журнал списаний за платные функции Video Studio (и других продуктов
+    на общем балансе). Заполняется только функцией charge_user() из
+    billing.py — на стороне сервера, цена всегда считается сервером."""
+    __tablename__ = "charges"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String, index=True, nullable=False)
+    product = Column(String, nullable=False)         # например "video-studio"
+    feature = Column(String, nullable=False)         # "tts", "voice_removal", "cloud_render" и т.п.
+    amount_usd = Column(Float, nullable=False)       # сколько списано
+    units = Column(Float, nullable=True)             # за что: секунды, минуты, символы
+    note = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
 
