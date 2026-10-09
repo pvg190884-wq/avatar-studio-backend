@@ -12,7 +12,9 @@ Avatar Studio — модуль биллинга.
   создании заявки админу мгновенно приходит сообщение в Telegram со
   ссылкой на подтверждение в один клик, без Swagger/curl;
 - списание с баланса за генерацию (посекундно, +50% наценка к стоимости
-  GPU-времени RunPod).
+  GPU-времени RunPod);
+- единый баланс для Video Studio: журнал списаний, история операций и
+  подписка Video Studio (199 ₽ в месяц, оплата с общего баланса).
 
 Переменные окружения:
   CRYPTO_PAY_TOKEN               — получить через @CryptoBot командой /pay -> Create App
@@ -28,16 +30,17 @@ Avatar Studio — модуль биллинга.
 import os
 import json
 import hmac
+import math
 import hashlib
 import asyncio
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from database import get_db, User, Deposit, init_db
+from database import get_db, User, Deposit, Charge, Subscription, init_db
 from auth_utils import get_current_user_id
 
 CRYPTO_PAY_TOKEN = os.getenv("CRYPTO_PAY_TOKEN")
@@ -497,3 +500,176 @@ async def estimate_cost(duration_seconds: float, tier: str = "basic"):
         "tier": tier,
         "estimated_cost_usd": cost,
     }
+
+
+# ---------- Единый баланс: списания за платные функции Video Studio ----------
+
+def charge_user(
+    db: Session,
+    user_id: str,
+    amount_usd: float,
+    feature: str,
+    units: float = None,
+    note: str = None,
+    product: str = "video-studio",
+) -> float:
+    """ВНУТРЕННЯЯ функция списания — это НЕ роут, из браузера её вызвать
+    нельзя. Вызывается только из серверных эндпоинтов, которые сами
+    выполняют платную работу (синтез речи, удаление голоса, облачный
+    рендер) и сами считают цену на сервере. Так клиент не может
+    подставить свою цену.
+
+    Списание атомарное: строка пользователя блокируется на время
+    транзакции (with_for_update), поэтому два одновременных запроса не
+    смогут уйти в минус. При нехватке средств — HTTP 402. Возвращает
+    новый баланс."""
+    amount = round(float(amount_usd), 4)
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="Некорректная сумма списания")
+
+    user = db.query(User).filter(User.user_id == user_id).with_for_update().first()
+    if not user or (user.balance_usd or 0.0) < amount:
+        db.rollback()
+        raise HTTPException(status_code=402, detail="Недостаточно средств на балансе")
+
+    user.balance_usd -= amount
+    db.add(Charge(
+        user_id=user_id,
+        product=product,
+        feature=feature,
+        amount_usd=amount,
+        units=units,
+        note=note,
+    ))
+    db.commit()
+    return round(user.balance_usd, 4)
+
+
+@router.get("/history")
+async def billing_history(db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
+    """Последние операции пользователя: подтверждённые пополнения и
+    списания за функции Video Studio (списания за генерации Avatar
+    Studio в этот журнал пока не пишутся)."""
+    deposits = (
+        db.query(Deposit)
+        .filter(Deposit.user_id == user_id, Deposit.status == "confirmed")
+        .order_by(Deposit.created_at.desc())
+        .limit(30)
+        .all()
+    )
+    charges = (
+        db.query(Charge)
+        .filter(Charge.user_id == user_id)
+        .order_by(Charge.created_at.desc())
+        .limit(30)
+        .all()
+    )
+    items = [
+        {
+            "kind": "deposit",
+            "amount_usd": round(d.amount_usd or 0.0, 4),
+            "label": f"Пополнение · {d.method}",
+            "at": (d.confirmed_at or d.created_at).isoformat() + "Z",
+        }
+        for d in deposits
+    ]
+    items += [
+        {
+            "kind": "charge",
+            "amount_usd": -round(c.amount_usd, 4),
+            "label": f"{c.product} · {c.feature}",
+            "at": c.created_at.isoformat() + "Z",
+        }
+        for c in charges
+    ]
+    items.sort(key=lambda x: x["at"], reverse=True)
+    return {"items": items[:30]}
+
+
+# ---------- Подписка Video Studio: 199 ₽ / 30 дней, оплата с общего баланса ----------
+
+VIDEO_SUB_PRODUCT = "video-studio"
+VIDEO_SUB_PRICE_RUB = 199.0
+VIDEO_SUB_DAYS = 30
+
+
+def video_sub_price_usd() -> float:
+    """Цена подписки в USD по тому же курсу, что и рублёвые пополнения.
+    Округление ВНИЗ до 4 знаков: пополнение ровно на 199 ₽ (по СБП или
+    через Crypto Pay в RUB) зачисляется как 199 * RUB_TO_USD_RATE и
+    всегда покрывает цену подписки без копеечной недостачи."""
+    return math.floor(VIDEO_SUB_PRICE_RUB * RUB_TO_USD_RATE * 10000) / 10000
+
+
+def _sub_payload(sub) -> dict:
+    now = datetime.utcnow()
+    active = bool(sub and sub.until and sub.until > now)
+    return {
+        "active": active,
+        "until": (sub.until.isoformat() + "Z") if sub and sub.until else None,
+        "price_rub": VIDEO_SUB_PRICE_RUB,
+        "price_usd": video_sub_price_usd(),
+        "days": VIDEO_SUB_DAYS,
+    }
+
+
+@router.get("/subscription")
+async def get_subscription(db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
+    """Статус подписки Video Studio у текущего пользователя + цена."""
+    sub = db.query(Subscription).filter(
+        Subscription.user_id == user_id,
+        Subscription.product == VIDEO_SUB_PRODUCT,
+    ).first()
+    return _sub_payload(sub)
+
+
+@router.post("/subscribe")
+async def subscribe_video(db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
+    """Покупка/продление подписки Video Studio с общего баланса.
+    Списание, запись в журнал и продление подписки — в ОДНОЙ транзакции:
+    либо всё, либо ничего. Цену считает сервер, клиент её не передаёт.
+    Если подписка ещё действует, +30 дней добавляются к её концу."""
+    price = video_sub_price_usd()
+    now = datetime.utcnow()
+
+    user = db.query(User).filter(User.user_id == user_id).with_for_update().first()
+    if not user or (user.balance_usd or 0.0) < price:
+        db.rollback()
+        raise HTTPException(status_code=402, detail="Недостаточно средств на балансе")
+
+    # защита от двойного клика: вторая покупка в течение 15 секунд отклоняется
+    recent = db.query(Charge).filter(
+        Charge.user_id == user_id,
+        Charge.feature == "subscription",
+        Charge.created_at > now - timedelta(seconds=15),
+    ).first()
+    if recent:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Подписка уже оформляется, подождите несколько секунд")
+
+    sub = db.query(Subscription).filter(
+        Subscription.user_id == user_id,
+        Subscription.product == VIDEO_SUB_PRODUCT,
+    ).with_for_update().first()
+    start = sub.until if (sub and sub.until and sub.until > now) else now
+    until = start + timedelta(days=VIDEO_SUB_DAYS)
+    if sub:
+        sub.until = until
+    else:
+        sub = Subscription(user_id=user_id, product=VIDEO_SUB_PRODUCT, until=until)
+        db.add(sub)
+
+    user.balance_usd -= price
+    db.add(Charge(
+        user_id=user_id,
+        product=VIDEO_SUB_PRODUCT,
+        feature="subscription",
+        amount_usd=price,
+        units=VIDEO_SUB_DAYS,
+        note=f"{VIDEO_SUB_PRICE_RUB:.0f} ₽ / {VIDEO_SUB_DAYS} дн.",
+    ))
+    db.commit()
+
+    payload = _sub_payload(sub)
+    payload["balance_usd"] = round(user.balance_usd, 4)
+    return payload
