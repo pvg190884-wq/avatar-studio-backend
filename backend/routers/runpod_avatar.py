@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 
 from database import get_db
 from auth_utils import get_current_user_id
-from routers.billing import calculate_generation_cost, get_or_create_user
+from routers.billing import calculate_generation_cost, get_or_create_user, charge_user as charge_feature
 
 load_dotenv()
 
@@ -104,6 +104,26 @@ QUEUE_WAIT_LIMIT_SECONDS = int(os.getenv("QUEUE_WAIT_LIMIT_SECONDS", "600"))
 # 24 часа и может запуститься, когда она уже никому не нужна, — а GPU платная.
 # ВАЖНО: это жёсткий лимит, он должен покрывать и ожидание, и саму генерацию.
 LONGCAT_JOB_TTL_SECONDS = int(os.getenv("LONGCAT_JOB_TTL_SECONDS", "3600"))
+
+# ---------- Озвучка текста для Video Studio ----------
+# Цена для клиента за 1 секунду готовой озвучки. ЭТО СТАРТОВОЕ ЗНАЧЕНИЕ:
+# пересчитайте по факту замера в RunPod (как у RUNPOD_COST_PER_SECOND_USD в
+# billing.py) и поменяйте переменной TTS_PRICE_PER_SECOND_USD на Railway.
+TTS_PRICE_PER_SECOND_USD = float(os.getenv("TTS_PRICE_PER_SECOND_USD", "0.006"))
+TTS_MAX_CHARS = 1500
+TTS_JOB_TTL_SECONDS = int(os.getenv("TTS_JOB_TTL_SECONDS", "900"))
+# Ключи — то, что шлёт Video Studio; значения — имена встроенных голосов XTTS-v2.
+# Проверьте имена запросом {"input": {"list_speakers": true}} к воркеру
+# SadTalker/XTTS и при необходимости поправьте здесь.
+TTS_VOICES = {
+    "f1": "Claribel Dervla",
+    "f2": "Daisy Studious",
+    "m1": "Andrew Chipper",
+    "m2": "Damien Black",
+}
+TTS_VOICE_STYLES = {"neutral", "lower", "higher", "warm", "bright"}
+TTS_TEMPOS = {"slow", "normal", "fast"}
+TTS_JOBS: dict[str, dict] = {}
 
 
 def get_media_duration_seconds(path: str) -> float:
@@ -616,6 +636,154 @@ async def generate_lipsync_from_text(
 
     job_id = f"{TEXT_LIPSYNC_PREFIX}{internal_id}"
     return {"job_id": job_id, "status_url": f"/api/generate/status/{job_id}"}
+
+
+def submit_tts_job(text: str, language: str, voice_style: str, speech_tempo: str,
+                   voice_sample_path: Optional[str], speaker: Optional[str]) -> str:
+    """Озвучка текста на воркере SadTalker/XTTS (режим tts_only)."""
+    inp = {
+        "tts_only": True,
+        "text": text,
+        "language": language,
+        "voice_style": voice_style,
+        "speech_tempo": speech_tempo,
+    }
+    if voice_sample_path:
+        with open(voice_sample_path, "rb") as f:
+            inp["voice_sample_base64"] = base64.b64encode(f.read()).decode("utf-8")
+    else:
+        inp["speaker"] = speaker
+
+    try:
+        resp = requests.post(
+            f"{RUNPOD_BASE_URL}/run", headers=HEADERS,
+            json={"input": inp, "policy": {"ttl": TTS_JOB_TTL_SECONDS * 1000}},
+            timeout=30,
+        )
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Не удалось связаться с RunPod (озвучка): {e}")
+
+    job_id = resp.json().get("id")
+    if not job_id:
+        raise HTTPException(status_code=502, detail="RunPod не вернул id задачи озвучки")
+    return job_id
+
+
+@router.post("/tts")
+async def generate_tts(
+    text: str = Form(...),
+    language: str = Form("ru"),
+    speaker: str = Form(""),
+    voice_style: str = Form("neutral"),
+    speech_tempo: str = Form("normal"),
+    voice_sample: Optional[UploadFile] = File(None),
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """Озвучка текста для Video Studio. Встроенный голос (speaker = f1/f2/m1/m2)
+    или клонирование по образцу (voice_sample). Деньги списываются только
+    когда готовый звук отдан клиенту (см. /tts-status)."""
+    text = (text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Введите текст для озвучки")
+    if len(text) > TTS_MAX_CHARS:
+        raise HTTPException(status_code=400, detail=f"Слишком длинный текст: максимум {TTS_MAX_CHARS} символов")
+    if voice_style not in TTS_VOICE_STYLES or speech_tempo not in TTS_TEMPOS:
+        raise HTTPException(status_code=400, detail="Неизвестный тембр или темп речи")
+
+    # Предварительная проверка баланса по длине текста (≈13 символов в секунду
+    # речи); берём половину оценки, точная сумма считается по готовому звуку.
+    est_cost = round(max(2.0, len(text) / 13.0) * TTS_PRICE_PER_SECOND_USD, 4)
+    ensure_balance(db, user_id, round(est_cost * 0.5, 4))
+
+    sample_path = None
+    if voice_sample is not None and voice_sample.filename:
+        data = await voice_sample.read()
+        if len(data) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Образец голоса слишком большой")
+        sample_path = os.path.join(TEMP_DIR, f"{uuid.uuid4().hex}_voice.wav")
+        with open(sample_path, "wb") as f:
+            f.write(data)
+    elif speaker not in TTS_VOICES:
+        raise HTTPException(status_code=400, detail="Выберите голос")
+
+    try:
+        job_id = await asyncio.to_thread(
+            submit_tts_job, text, language, voice_style, speech_tempo,
+            sample_path, TTS_VOICES.get(speaker),
+        )
+    finally:
+        if sample_path and os.path.exists(sample_path):
+            os.remove(sample_path)
+
+    TTS_JOBS[job_id] = {"user_id": user_id, "chars": len(text), "paid": False, "lock": asyncio.Lock()}
+    return {"job_id": job_id, "status_url": f"/api/generate/tts-status/{job_id}", "estimate_usd": est_cost}
+
+
+@router.get("/tts-status/{job_id}")
+async def get_tts_status(
+    job_id: str,
+    user_id: str = Depends(get_current_user_id),
+    db: Session = Depends(get_db),
+):
+    """Опрос озвучки. Пока идёт — JSON со статусом; когда готово — WAV-файл.
+    Списание происходит один раз, при первой выдаче готового файла; если на
+    балансе не хватает (402), файл не отдаётся и можно повторить опрос после
+    пополнения."""
+    entry = TTS_JOBS.get(job_id)
+    if entry is None or entry["user_id"] != user_id:
+        raise HTTPException(status_code=404, detail="Задача не найдена (возможно, сервер перезапускался)")
+
+    out_path = os.path.join(OUTPUT_DIR, f"tts_{job_id}.wav")
+    if entry["paid"] and os.path.exists(out_path):
+        return FileResponse(out_path, media_type="audio/wav", filename="voiceover.wav")
+
+    resp = await asyncio.to_thread(requests.get, f"{RUNPOD_BASE_URL}/status/{job_id}", headers=HEADERS, timeout=30)
+    if resp.status_code == 404:
+        TTS_JOBS.pop(job_id, None)
+        raise HTTPException(status_code=504, detail="Время ожидания озвучки истекло. Деньги не списаны, попробуйте ещё раз.")
+
+    data = resp.json()
+    status = data.get("status")
+
+    if status == "COMPLETED":
+        output = data.get("output") or {}
+        if output.get("error"):
+            TTS_JOBS.pop(job_id, None)
+            raise HTTPException(status_code=502, detail=f"Озвучка не удалась: {output['error']}. Деньги не списаны.")
+        audio_b64 = output.get("audio_base64")
+        if not audio_b64:
+            TTS_JOBS.pop(job_id, None)
+            raise HTTPException(status_code=502, detail="Озвучка не вернула звук. Деньги не списаны.")
+
+        async with entry["lock"]:
+            if not entry["paid"]:
+                def _write():
+                    with open(out_path, "wb") as f:
+                        f.write(base64.b64decode(audio_b64))
+
+                await asyncio.to_thread(_write)
+                try:
+                    duration = get_media_duration_seconds(out_path)
+                    if user_id not in UNLIMITED_USER_IDS:
+                        cost = round(max(duration, 1.0) * TTS_PRICE_PER_SECOND_USD, 4)
+                        charge_feature(
+                            db, user_id, cost, feature="tts",
+                            units=round(duration, 2), note=f"{entry['chars']} симв.",
+                        )
+                    entry["paid"] = True
+                except Exception:
+                    if os.path.exists(out_path):
+                        os.remove(out_path)
+                    raise
+        return FileResponse(out_path, media_type="audio/wav", filename="voiceover.wav")
+
+    if status in ("FAILED", "CANCELLED", "TIMED_OUT"):
+        TTS_JOBS.pop(job_id, None)
+        raise HTTPException(status_code=502, detail=f"Озвучка не удалась ({status}). Деньги не списаны.")
+
+    return {"job_id": job_id, "status": status}
 
 
 @router.get("/status/{job_id}")
