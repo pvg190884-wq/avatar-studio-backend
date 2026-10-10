@@ -8,8 +8,15 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routers.runpod_avatar import router as runpod_avatar_router
 from routers.billing import router as billing_router
-from routers.ai import router as ai_router
 from database import init_db
+
+# Раздел ИИ (расшифровка речи) подключаем с защитой: если его файла нет или в нём
+# ошибка, остальной бэкенд (генерации, баланс, подписка) всё равно запустится.
+try:
+    from routers.ai import router as ai_router
+except Exception as e:
+    ai_router = None
+    print(f"ВНИМАНИЕ: раздел ИИ (routers/ai.py) не загружен: {e!r}")
 
 app = FastAPI(title="Avatar Studio Backend (Cloud)")
 app.add_middleware(
@@ -20,7 +27,8 @@ app.add_middleware(
 )
 app.include_router(runpod_avatar_router)
 app.include_router(billing_router)
-app.include_router(ai_router)
+if ai_router is not None:
+    app.include_router(ai_router)
 
 
 @app.on_event("startup")
