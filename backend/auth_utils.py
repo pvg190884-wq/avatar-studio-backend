@@ -13,6 +13,7 @@ Avatar Studio — проверка авторизации через Supabase Au
   SUPABASE_PUBLISHABLE_KEY — Publishable key (безопасен для фронтенда)
 """
 import os
+import asyncio
 import requests
 from fastapi import Header, HTTPException
 
@@ -25,7 +26,13 @@ async def get_current_user_id(authorization: str = Header(...)) -> str:
     Depends(get_current_user_id). Проверяет access_token у Supabase и
     возвращает id пользователя (UUID из Supabase) — использовать именно
     его как user_id в таблицах users/deposits, а не то, что прислал бы
-    клиент сам по себе."""
+    клиент сам по себе.
+
+    ВАЖНО: запрос к Supabase синхронный (requests), поэтому выполняется
+    через asyncio.to_thread — иначе, пока Supabase отвечает (до 10 секунд),
+    event loop FastAPI замирает и сервер не отвечает вообще никому. Проверка
+    вызывается на каждый защищённый запрос, в том числе на частый опрос
+    статуса озвучки."""
     if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
         raise HTTPException(status_code=500, detail="Supabase не настроен на сервере")
 
@@ -34,14 +41,19 @@ async def get_current_user_id(authorization: str = Header(...)) -> str:
 
     token = authorization.removeprefix("Bearer ").strip()
 
-    resp = requests.get(
-        f"{SUPABASE_URL}/auth/v1/user",
-        headers={
-            "apikey": SUPABASE_PUBLISHABLE_KEY,
-            "Authorization": f"Bearer {token}",
-        },
-        timeout=10,
-    )
+    try:
+        resp = await asyncio.to_thread(
+            requests.get,
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers={
+                "apikey": SUPABASE_PUBLISHABLE_KEY,
+                "Authorization": f"Bearer {token}",
+            },
+            timeout=10,
+        )
+    except requests.exceptions.RequestException:
+        raise HTTPException(status_code=503, detail="Сервис авторизации временно недоступен, попробуйте ещё раз")
+
     if resp.status_code != 200:
         raise HTTPException(status_code=401, detail="Недействительный или истёкший токен авторизации")
 
