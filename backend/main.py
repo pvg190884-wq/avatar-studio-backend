@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from routers.runpod_avatar import router as runpod_avatar_router
 from routers.billing import router as billing_router
+from routers.ai import router as ai_router
 from database import init_db
 
 app = FastAPI(title="Avatar Studio Backend (Cloud)")
@@ -19,6 +20,7 @@ app.add_middleware(
 )
 app.include_router(runpod_avatar_router)
 app.include_router(billing_router)
+app.include_router(ai_router)
 
 
 @app.on_event("startup")
