@@ -52,6 +52,7 @@ EDIT_COST_MULTIPLIER = float(os.getenv("EDIT_COST_MULTIPLIER", "3"))
 EDIT_MAX_SEGMENTS = 600
 EDIT_MAX_CHARS = 60000
 EDIT_MAX_OPS = 8
+EDIT_MAX_SHORTS = 10
 
 UNLIMITED_USER_IDS = {u.strip() for u in os.getenv("UNLIMITED_USER_IDS", "").split(",") if u.strip()}
 
@@ -244,10 +245,11 @@ You cannot touch the video directly. You may only use these operations in "ops" 
 - {"op":"subtitles","size":3-12,"per":1-8,"color":"#rrggbb","hl":"#rrggbb" or "","bg":"shadow|outline|box|none","y":0.1-0.95,"upper":true|false,"font":"Manrope|Montserrat|Oswald|Playfair Display|Lora|Pacifico|Caveat|Russo One"}  add or restyle subtitles; every field is optional.
 - {"op":"cover","tpl":"gradient|minimal|neon|cinema|split|glitch","title":"...","sub":"...","where":"start|end"}  add a 4-second animated title card.
 - {"op":"color","preset":"none|cinema|warm|cold|vintage|vivid|faded|bw|noir|sepia","strength":0-1}  colour-grade all clips.
+- {"op":"shorts","clips":[{"title":"<hook title, max 60 chars, in the language of the transcript>","segments":[ids]}]}  cut separate short vertical videos (Reels / Shorts / TikTok) WITHOUT changing the main timeline. Each item is one self-contained, engaging moment: it starts with a strong hook sentence, ends on a finished thought, segments are in chronological order. Default length of one short is 20-60 seconds (follow the length and the number the user asks for; default 3 shorts; at most 10). Use the segment durations to hit the length. Items must not overlap each other. When the user asks for shorts / reels / rilsy / нарезку, use ONLY this operation.
 
 Rules:
 - Use only segment ids that appear in the transcript. Never invent ids or times.
-- If the transcript is empty, do not use cut, keep or fillers.
+- If the transcript is empty, do not use cut, keep, fillers or shorts.
 - If the command cannot be done with these operations, return "ops": [] and explain in "message" what is possible instead.
 - Do not remove more than needed. When unsure, prefer a conservative edit and say so in "message".
 - "message" is short (1-3 sentences) and describes what the ops will do. Never claim something that is not in "ops".
@@ -279,7 +281,7 @@ def _chat(model: str, system: str, user: str) -> tuple[str, dict]:
         "model": model,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
         "temperature": 0.2,
-        "max_tokens": 1500,
+        "max_tokens": 1800,
         "response_format": {"type": "json_object"},
         "usage": {"include": True},
     }
@@ -392,6 +394,17 @@ def _clean_plan(parsed, n: int):
             if o.get("preset") in COLOR_PRESETS:
                 st = _num(o.get("strength"), 0, 1)
                 ops.append({"op": "color", "preset": o["preset"], "strength": 1.0 if st is None else st})
+        elif kind == "shorts":
+            items = []
+            raw_clips = o.get("clips")
+            for c in (raw_clips if isinstance(raw_clips, list) else [])[:EDIT_MAX_SHORTS]:
+                if not isinstance(c, dict):
+                    continue
+                ids = _ids(c.get("segments"), n)
+                if ids:
+                    items.append({"title": str(c.get("title") or "")[:80], "segments": ids})
+            if items:
+                ops.append({"op": "shorts", "clips": items})
     return {"message": str(parsed.get("message") or "")[:600], "ops": ops}
 
 
