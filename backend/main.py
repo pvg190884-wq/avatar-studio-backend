@@ -4,8 +4,10 @@ Avatar Studio — облачный бэкенд (прокси к RunPod Serverle
 Хранит RunPod API-ключ на сервере, принимает запросы от сайта, передаёт
 их в RunPod, возвращает готовое видео.
 """
-from fastapi import FastAPI
+import traceback
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from routers.runpod_avatar import router as runpod_avatar_router
 from routers.billing import router as billing_router
 from database import init_db
@@ -25,6 +27,24 @@ except Exception as e:
     print(f"ВНИМАНИЕ: раздел поддержки (routers/support.py) не загружен: {e!r}")
 
 app = FastAPI(title="Avatar Studio Backend (Cloud)")
+
+
+# ВАЖНО: этот перехватчик ошибок должен быть добавлен ДО CORS-прослойки (так он оказывается внутри неё).
+# Иначе необработанная ошибка превращается в ответ без CORS-заголовков, и браузер показывает
+# только «Failed to fetch» вместо настоящей причины.
+@app.middleware("http")
+async def catch_errors(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except Exception as e:
+        print(f"Необработанная ошибка {request.method} {request.url.path}: {e!r}")
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Внутренняя ошибка сервера ({type(e).__name__}). Попробуйте ещё раз."},
+        )
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # сузим до конкретного домена сайта, когда он будет готов
