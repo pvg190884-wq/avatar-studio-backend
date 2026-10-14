@@ -9,12 +9,14 @@ Avatar Studio — модуль биллинга.
   (2) опрос /check-deposit из браузера — подстраховка/быстрый визуальный
   отклик, если вебхук ещё не настроен или чуть задержался;
 - пополнение через СБП (личный перевод по номеру телефона) — при
-  создании заявки админу мгновенно приходит сообщение в Telegram со
-  ссылкой на подтверждение в один клик, без Swagger/curl;
+  создании заявки админу мгновенно приходит сообщение в Telegram и/или
+  MAX со ссылкой на подтверждение в один клик, без Swagger/curl;
 - списание с баланса за генерацию (посекундно, +50% наценка к стоимости
   GPU-времени RunPod);
 - единый баланс для Video Studio: журнал списаний, история операций и
-  подписка Video Studio (199 ₽ в месяц, оплата с общего баланса).
+  подписка Video Studio (199 ₽ в месяц, оплата с общего баланса);
+- информационные уведомления админу: подписка оформлена/продлена,
+  пополнение через Crypto Pay зачислено.
 
 Переменные окружения:
   CRYPTO_PAY_TOKEN               — получить через @CryptoBot командой /pay -> Create App
@@ -24,6 +26,12 @@ Avatar Studio — модуль биллинга.
   SBP_PHONE                      — номер телефона для личных переводов по СБП
   TELEGRAM_BOT_TOKEN             — токен бота (у @BotFather), для уведомлений админу
   ADMIN_TELEGRAM_CHAT_ID         — твой личный Telegram chat_id (куда слать уведомления)
+  MAX_API_TOKEN                  — токен бота в MAX (платформа MAX для партнёров -> Интеграция)
+  MAX_API_URL                    — адрес API MAX (как в боте bestconsulting-AI, без /messages на конце)
+  MAX_ADMIN_USER_ID              — твой MAX user_id (по умолчанию 111620312)
+  MAX_ADMIN_CHAT_ID              — необязательно: chat_id диалога с ботом; если задан, используется вместо user_id
+  NOTIFY_CHANNELS                — каналы уведомлений через запятую: telegram,max (по умолчанию оба)
+  NOTIFY_INFO                    — 0 отключает информационные сообщения (подписки, Crypto Pay); по умолчанию включены
   BACKEND_PUBLIC_URL             — публичный адрес этого бэкенда (для ссылок в уведомлениях)
   DATABASE_URL                   — создаётся автоматически Railway при добавлении Postgres
 """
@@ -34,6 +42,7 @@ import math
 import hashlib
 import asyncio
 import requests
+import urllib3
 from datetime import datetime, timedelta
 from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi.responses import HTMLResponse
@@ -58,7 +67,26 @@ CRYPTO_PAY_WEBHOOK_SECRET_PATH = os.getenv("CRYPTO_PAY_WEBHOOK_SECRET_PATH", "")
 # Для мгновенных уведомлений админу о новых заявках СБП в Telegram.
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ADMIN_TELEGRAM_CHAT_ID = os.getenv("ADMIN_TELEGRAM_CHAT_ID")
-BACKEND_PUBLIC_URL = os.getenv("BACKEND_PUBLIC_URL", "https://avatar-studio-backend-production.up.railway.app")
+BACKEND_PUBLIC_URL = os.getenv("BACKEND_PUBLIC_URL", "https://api.avatar-studio.bestconsulting-usa.ru").rstrip("/")
+
+# Уведомления в MAX (тот же бот, что в bestconsulting-AI). Получатель —
+# личный диалог владельца: по user_id (по умолчанию founder ID из Core)
+# или, если задан MAX_ADMIN_CHAT_ID, по chat_id.
+MAX_API_TOKEN = os.getenv("MAX_API_TOKEN")
+_max_url = (os.getenv("MAX_API_URL") or "https://platform-api.max.ru").strip().rstrip("/")
+if _max_url.endswith("/messages"):
+    _max_url = _max_url[: -len("/messages")]
+MAX_API_URL = _max_url
+MAX_ADMIN_USER_ID = os.getenv("MAX_ADMIN_USER_ID", "111620312")
+MAX_ADMIN_CHAT_ID = os.getenv("MAX_ADMIN_CHAT_ID")
+
+# В какие каналы слать уведомления админу: telegram, max или оба.
+NOTIFY_CHANNELS = {c.strip().lower() for c in os.getenv("NOTIFY_CHANNELS", "telegram,max").split(",") if c.strip()}
+
+# Информационные сообщения (подписка оформлена, пополнение Crypto Pay
+# зачислено). NOTIFY_INFO=0 отключает их; заявки СБП и обращения в
+# поддержку приходят всегда.
+NOTIFY_INFO = os.getenv("NOTIFY_INFO", "1").strip() != "0"
 
 # Наценка поверх фактической стоимости GPU-времени RunPod.
 MARKUP_COEFFICIENT = 1.5  # +50%
@@ -130,6 +158,10 @@ class SbpConfirmBody(BaseModel):
     approve: bool  # True — подтвердить и зачислить, False — отклонить
 
 
+class NotifyTestBody(BaseModel):
+    admin_secret: str
+
+
 def get_or_create_user(db: Session, user_id: str) -> User:
     user = db.query(User).filter(User.user_id == user_id).first()
     if not user:
@@ -196,14 +228,19 @@ def check_crypto_pay_invoice(invoice_id: int) -> dict:
     return data["result"]["items"][0]
 
 
-def credit_deposit_if_pending(db: Session, invoice: dict) -> bool:
+def credit_deposit_if_pending(db: Session, invoice: dict):
     """Общая логика зачисления по оплаченному инвойсу Crypto Pay —
     используется и из вебхука (см. /crypto-webhook), и из ручного
     опроса /check-deposit из браузера. Идемпотентна: если депозит уже
     не в статусе pending (например, оба пути сработали почти
     одновременно), просто ничего не делает — защита от двойного
     зачисления. .with_for_update() блокирует строку на время
-    транзакции, чтобы исключить гонку между вебхуком и опросом."""
+    транзакции, чтобы исключить гонку между вебхуком и опросом.
+
+    Возвращает словарь с данными зачисления (user_id, method, amount,
+    amount_usd), если зачисление выполнено ИМЕННО этим вызовом, иначе
+    False. По этому результату вызывающий код шлёт информационное
+    уведомление: оно приходит ровно один раз."""
     invoice_id = invoice.get("invoice_id")
     if invoice_id is None or invoice.get("status") != "paid":
         return False
@@ -228,8 +265,15 @@ def credit_deposit_if_pending(db: Session, invoice: dict) -> bool:
     deposit.status = "confirmed"
     deposit.amount_usd = amount_usd
     deposit.confirmed_at = datetime.utcnow()
+    # данные для уведомления берём ДО commit (после него объекты обновляются из БД)
+    info = {
+        "user_id": deposit.user_id,
+        "method": deposit.method,
+        "amount": deposit.amount,
+        "amount_usd": amount_usd,
+    }
     db.commit()
-    return True
+    return info
 
 
 def verify_crypto_pay_signature(raw_body: bytes, signature_header: str) -> bool:
@@ -243,7 +287,7 @@ def verify_crypto_pay_signature(raw_body: bytes, signature_header: str) -> bool:
     return hmac.compare_digest(computed, signature_header)
 
 
-def send_telegram_message(chat_id: str, text: str):
+def send_telegram_message(chat_id: str, text: str) -> bool:
     """ВАЖНО: это синхронная блокирующая функция (requests.post). Она
     ДОЛЖНА вызываться только через asyncio.to_thread() из async-кода —
     иначе, пока Telegram API отвечает (вплоть до timeout=10 секунд),
@@ -253,24 +297,126 @@ def send_telegram_message(chat_id: str, text: str):
     найден и исправлен в runpod_avatar.py для вызовов RunPod — здесь
     он был пропущен). См. историю чата: именно это вызвало 10-минутное
     зависание заявки СБП и одновременный сбой у другого пользователя,
-    никак не связанного с СБП."""
+    никак не связанного с СБП.
+
+    Возвращает True, если Telegram принял сообщение."""
     if not TELEGRAM_BOT_TOKEN or not chat_id:
         print("TELEGRAM_BOT_TOKEN/ADMIN_TELEGRAM_CHAT_ID не настроены — уведомление не отправлено")
-        return
+        return False
     try:
-        requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
             timeout=10,
         )
+        return r.ok
     except requests.exceptions.RequestException as e:
         print(f"Не удалось отправить Telegram-уведомление: {e}")
+        return False
+
+
+def send_max_message(text: str, button_text: str = None, button_url: str = None) -> tuple:
+    """Отправка сообщения админу в MAX (POST {MAX_API_URL}/messages).
+    Токен передаётся в заголовке Authorization без слова Bearer (так
+    требует API MAX). Если задана кнопка, под сообщением показывается
+    кнопка-ссылка (inline_keyboard, type=link).
+
+    Как и send_telegram_message(), это СИНХРОННАЯ блокирующая функция:
+    вызывать только через asyncio.to_thread().
+
+    Возвращает (успех: bool, пояснение: str)."""
+    if not MAX_API_TOKEN:
+        print("MAX_API_TOKEN не настроен — уведомление в MAX не отправлено")
+        return False, "MAX_API_TOKEN не настроен"
+    if MAX_ADMIN_CHAT_ID:
+        params = {"chat_id": MAX_ADMIN_CHAT_ID}
+    elif MAX_ADMIN_USER_ID:
+        params = {"user_id": MAX_ADMIN_USER_ID}
+    else:
+        return False, "не задан MAX_ADMIN_USER_ID / MAX_ADMIN_CHAT_ID"
+
+    body = {"text": text[:4000]}
+    if button_text and button_url:
+        body["attachments"] = [{
+            "type": "inline_keyboard",
+            "payload": {"buttons": [[{"type": "link", "text": button_text, "url": button_url}]]},
+        }]
+    headers = {"Authorization": MAX_API_TOKEN, "Content-Type": "application/json"}
+    url = f"{MAX_API_URL}/messages"
+
+    try:
+        try:
+            r = requests.post(url, params=params, headers=headers, json=body, timeout=10)
+        except requests.exceptions.SSLError as e:
+            # Бот bestconsulting-AI ходит в MAX с verify=False: у площадки бывают
+            # проблемы с цепочкой сертификатов. Повторяем один раз так же.
+            print(f"MAX: ошибка проверки сертификата ({e}); повтор без проверки")
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            r = requests.post(url, params=params, headers=headers, json=body, timeout=10, verify=False)
+        if r.status_code == 200:
+            return True, "ok"
+        info = f"{r.status_code}: {r.text[:200]}"
+        print(f"MAX: уведомление не отправлено — {info}")
+        return False, info
+    except requests.exceptions.RequestException as e:
+        print(f"Не удалось отправить MAX-уведомление: {e}")
+        return False, str(e)[:200]
+
+
+def notify_admin(text: str, button_text: str = None, button_url: str = None) -> bool:
+    """Уведомление админу во все включённые каналы (NOTIFY_CHANNELS).
+    Сбой одного канала не мешает другому. Синхронная — вызывать через
+    asyncio.to_thread(). Возвращает True, если сообщение дошло хотя бы
+    в один канал."""
+    sent = False
+    if "telegram" in NOTIFY_CHANNELS:
+        try:
+            sent = bool(send_telegram_message(ADMIN_TELEGRAM_CHAT_ID, text)) or sent
+        except Exception as e:
+            print(f"Telegram-уведомление: непредвиденная ошибка {e}")
+    if "max" in NOTIFY_CHANNELS:
+        try:
+            ok, _info = send_max_message(text, button_text, button_url)
+            sent = ok or sent
+        except Exception as e:
+            print(f"MAX-уведомление: непредвиденная ошибка {e}")
+    return sent
+
+
+def notify_info(text: str) -> bool:
+    """Информационное сообщение админу (без кнопки). Отключается
+    переменной NOTIFY_INFO=0."""
+    if not NOTIFY_INFO:
+        return False
+    return notify_admin(text)
+
+
+def notify_configured() -> bool:
+    """Есть ли хотя бы один включённый и настроенный канал уведомлений
+    (используется чатом поддержки перед отправкой обращения)."""
+    tg = "telegram" in NOTIFY_CHANNELS and bool(TELEGRAM_BOT_TOKEN and ADMIN_TELEGRAM_CHAT_ID)
+    mx = "max" in NOTIFY_CHANNELS and bool(MAX_API_TOKEN and (MAX_ADMIN_CHAT_ID or MAX_ADMIN_USER_ID))
+    return tg or mx
+
+
+# Ссылки на фоновые задачи уведомлений: без них Python может удалить задачу
+# до её завершения.
+_bg_tasks = set()
+
+
+def _fire_and_forget(func, *args):
+    """Запускает синхронную функцию в отдельном потоке и НЕ ждёт её
+    завершения: клиент получает ответ сразу, даже если Telegram или MAX
+    отвечают медленно."""
+    task = asyncio.create_task(asyncio.to_thread(func, *args))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
 
 
 def make_sbp_confirm_token(deposit_id: int) -> str:
     """Короткий токен, привязанный к конкретной заявке (не универсальный
     пароль) — вычисляется из ADMIN_SECRET, так что ссылку можно смело
-    отправлять в Telegram: она работает только для этой одной заявки,
+    отправлять в Telegram/MAX: она работает только для этой одной заявки,
     а сам ADMIN_SECRET в ней не фигурирует."""
     return hmac.new(ADMIN_SECRET.encode(), str(deposit_id).encode(), hashlib.sha256).hexdigest()[:16]
 
@@ -284,7 +430,17 @@ def notify_admin_new_sbp_request(deposit_id: int, amount_rub: float, user_id: st
         f"Клиент: {user_id}\n\n"
         f"Подтвердить зачисление (один клик):\n{confirm_url}"
     )
-    send_telegram_message(ADMIN_TELEGRAM_CHAT_ID, text)
+    notify_admin(text, "Подтвердить зачисление", confirm_url)
+
+
+def deposit_info_text(c: dict) -> str:
+    """Текст информационного сообщения о зачисленном пополнении Crypto Pay."""
+    return (
+        "\U0001F4B5 Пополнение баланса (Crypto Pay)\n"
+        f"Клиент: {c['user_id']}\n"
+        f"Оплачено: {c['amount']} {c['method']}\n"
+        f"Зачислено: ${c['amount_usd']:.2f}"
+    )
 
 
 def calculate_generation_cost(duration_seconds: float, tier: str = "basic") -> float:
@@ -337,7 +493,9 @@ async def check_deposit(req: InvoiceStatusRequest, db: Session = Depends(get_db)
     is_paid = invoice["status"] == "paid"
 
     if is_paid:
-        credit_deposit_if_pending(db, invoice)
+        credited = credit_deposit_if_pending(db, invoice)
+        if credited:
+            _fire_and_forget(notify_info, deposit_info_text(credited))
 
     return {
         "invoice_id": req.invoice_id,
@@ -381,7 +539,9 @@ async def crypto_pay_webhook(secret_path: str, request: Request, db: Session = D
     # только оплата счёта.
     if data.get("update_type") == "invoice_paid":
         invoice = data.get("payload", {})
-        credit_deposit_if_pending(db, invoice)
+        credited = credit_deposit_if_pending(db, invoice)
+        if credited:
+            _fire_and_forget(notify_info, deposit_info_text(credited))
 
     return {"ok": True}
 
@@ -394,12 +554,15 @@ async def sbp_request(
 ):
     """Клиент выбрал способ оплаты СБП -> создаётся заявка 'pending' ->
     фронтенд показывает номер телефона (SBP_PHONE). Админу мгновенно
-    приходит уведомление в Telegram со ссылкой на подтверждение в один
-    клик (см. /sbp/confirm-link) — без Swagger/curl.
+    приходит уведомление в Telegram и/или MAX (NOTIFY_CHANNELS) со
+    ссылкой на подтверждение в один клик (см. /sbp/confirm-link) — без
+    Swagger/curl. Заявка общая для Avatar Studio и Video Studio:
+    у них единый баланс.
 
-    Уведомление отправляется через asyncio.to_thread — см. подробный
-    комментарий у send_telegram_message() про то, почему синхронный
-    requests.post() здесь НЕЛЬЗЯ вызывать напрямую."""
+    Уведомление уходит в отдельном потоке (to_thread) и в фоне: см.
+    подробный комментарий у send_telegram_message() про то, почему
+    синхронный requests.post() здесь НЕЛЬЗЯ вызывать напрямую, а фон
+    нужен, чтобы клиент не ждал медленный ответ мессенджеров."""
     get_or_create_user(db, user_id)
 
     deposit = Deposit(
@@ -412,7 +575,7 @@ async def sbp_request(
     db.commit()
     db.refresh(deposit)
 
-    await asyncio.to_thread(notify_admin_new_sbp_request, deposit.id, req.amount_rub, user_id)
+    _fire_and_forget(notify_admin_new_sbp_request, deposit.id, req.amount_rub, user_id)
 
     return {
         "deposit_id": deposit.id,
@@ -426,12 +589,30 @@ async def sbp_request(
     }
 
 
+@router.post("/notify-test")
+async def notify_test(req: NotifyTestBody):
+    """Проверка уведомлений без реального платежа: отправляет тестовое
+    сообщение во все включённые каналы и показывает результат по каждому.
+    Защищено ADMIN_SECRET. Удобно вызывать из Swagger (/docs)."""
+    if not ADMIN_SECRET or not hmac.compare_digest(req.admin_secret.encode(), ADMIN_SECRET.encode()):
+        raise HTTPException(status_code=403, detail="Неверный admin_secret")
+
+    text = "\u2705 Тест уведомлений BestConsulting (Avatar Studio / Video Studio). Если вы это видите, канал настроен."
+    result = {}
+    if "telegram" in NOTIFY_CHANNELS:
+        result["telegram"] = {"ok": await asyncio.to_thread(send_telegram_message, ADMIN_TELEGRAM_CHAT_ID, text)}
+    if "max" in NOTIFY_CHANNELS:
+        ok, info = await asyncio.to_thread(send_max_message, text, "Открыть бэкенд", BACKEND_PUBLIC_URL)
+        result["max"] = {"ok": ok, "info": info}
+    return {"channels": sorted(NOTIFY_CHANNELS), "info_messages": NOTIFY_INFO, "result": result}
+
+
 @router.get("/sbp/confirm-link", response_class=HTMLResponse)
 async def sbp_confirm_link(deposit_id: int, token: str, db: Session = Depends(get_db)):
-    """Ссылка из Telegram-уведомления — одна ссылка подтверждает ровно
-    одну заявку. Открывается прямо в браузере (в том числе с телефона,
-    прямо из Telegram), никакого Swagger/curl/ручного ввода
-    ADMIN_SECRET не требуется."""
+    """Ссылка из уведомления (Telegram/MAX) — одна ссылка подтверждает
+    ровно одну заявку. Открывается прямо в браузере (в том числе с
+    телефона, прямо из мессенджера), никакого Swagger/curl/ручного
+    ввода ADMIN_SECRET не требуется."""
     expected_token = make_sbp_confirm_token(deposit_id)
     if not hmac.compare_digest(token, expected_token):
         return HTMLResponse("<h3>Ссылка неверна или устарела</h3>", status_code=403)
@@ -459,8 +640,8 @@ async def sbp_confirm_link(deposit_id: int, token: str, db: Session = Depends(ge
 @router.post("/sbp/confirm")
 async def sbp_confirm(req: SbpConfirmBody, db: Session = Depends(get_db)):
     """Запасной путь подтверждения СБП-заявки через admin_secret (на
-    случай, если Telegram-уведомление не пришло/потерялось) — тот же
-    механизм, что и раньше."""
+    случай, если уведомление не пришло/потерялось) — тот же механизм,
+    что и раньше."""
     if not ADMIN_SECRET or req.admin_secret != ADMIN_SECRET:
         raise HTTPException(status_code=403, detail="Неверный admin_secret")
 
@@ -613,6 +794,17 @@ def _sub_payload(sub) -> dict:
     }
 
 
+def subscription_info_text(user_id: str, renewed: bool, until: datetime, price_usd: float, balance_usd: float) -> str:
+    """Текст информационного сообщения о подписке Video Studio."""
+    return (
+        "\U0001F514 Подписка Video Studio " + ("продлена" if renewed else "оформлена") + "\n"
+        f"Клиент: {user_id}\n"
+        f"Списано: {VIDEO_SUB_PRICE_RUB:.0f} \u20bd (${price_usd:.2f}) с баланса\n"
+        f"Действует до: {until:%d.%m.%Y %H:%M} UTC\n"
+        f"Остаток баланса: ${balance_usd:.2f}"
+    )
+
+
 @router.get("/subscription")
 async def get_subscription(db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
     """Статус подписки Video Studio у текущего пользователя + цена."""
@@ -628,7 +820,9 @@ async def subscribe_video(db: Session = Depends(get_db), user_id: str = Depends(
     """Покупка/продление подписки Video Studio с общего баланса.
     Списание, запись в журнал и продление подписки — в ОДНОЙ транзакции:
     либо всё, либо ничего. Цену считает сервер, клиент её не передаёт.
-    Если подписка ещё действует, +30 дней добавляются к её концу."""
+    Если подписка ещё действует, +30 дней добавляются к её концу.
+    После успешной покупки админу уходит информационное сообщение
+    (Telegram и/или MAX), в фоне, чтобы не задерживать ответ клиенту."""
     price = video_sub_price_usd()
     now = datetime.utcnow()
 
@@ -651,7 +845,8 @@ async def subscribe_video(db: Session = Depends(get_db), user_id: str = Depends(
         Subscription.user_id == user_id,
         Subscription.product == VIDEO_SUB_PRODUCT,
     ).with_for_update().first()
-    start = sub.until if (sub and sub.until and sub.until > now) else now
+    was_active = bool(sub and sub.until and sub.until > now)
+    start = sub.until if was_active else now
     until = start + timedelta(days=VIDEO_SUB_DAYS)
     if sub:
         sub.until = until
@@ -672,4 +867,9 @@ async def subscribe_video(db: Session = Depends(get_db), user_id: str = Depends(
 
     payload = _sub_payload(sub)
     payload["balance_usd"] = round(user.balance_usd, 4)
+
+    _fire_and_forget(
+        notify_info,
+        subscription_info_text(user_id, was_active, until, price, payload["balance_usd"]),
+    )
     return payload
