@@ -58,6 +58,48 @@ HEADERS = {
     "Authorization": f"Bearer {RUNPOD_API_KEY}"
 }
 
+# ---------- Обращения к RunPod: понятные ошибки и повтор при лимите ----------
+# С 27 октября RunPod вводит общий лимит запросов к API и отвечает 429, если его превысить.
+# Раньше raise_for_status() превращал любой ответ RunPod в короткое «409 Client Error: Conflict»,
+# а сам текст причины, который RunPod присылает в теле ответа, терялся. Теперь он попадает
+# в сообщение об ошибке и в логи Railway.
+RUNPOD_RETRY_ATTEMPTS = 3
+
+
+def _rp_detail(resp) -> str:
+    """Текст ответа RunPod (коротко, одной строкой) для сообщения об ошибке и логов."""
+    try:
+        return (resp.text or "").strip().replace("\n", " ")[:300]
+    except Exception:
+        return ""
+
+
+def runpod_post(url: str, payload: dict, label: str, timeout: int = 30) -> dict:
+    """POST в RunPod. При 429 повторяет запрос (до RUNPOD_RETRY_ATTEMPTS раз, с нарастающей паузой).
+    Любая другая ошибка превращается в HTTPException 502 с настоящим ответом RunPod.
+    СИНХРОННАЯ функция: вызывать только через asyncio.to_thread (как и submit_*)."""
+    for attempt in range(RUNPOD_RETRY_ATTEMPTS):
+        try:
+            resp = requests.post(url, headers=HEADERS, json=payload, timeout=timeout)
+        except requests.exceptions.RequestException as e:
+            raise HTTPException(status_code=502, detail=f"Не удалось связаться с RunPod ({label}): {e}")
+        if resp.status_code == 429 and attempt < RUNPOD_RETRY_ATTEMPTS - 1:
+            time.sleep(2 * (attempt + 1))
+            continue
+        if resp.status_code >= 400:
+            body = _rp_detail(resp)
+            print(f"RunPod {label}: HTTP {resp.status_code} {url} -> {body}")
+            raise HTTPException(
+                status_code=502,
+                detail=f"RunPod ({label}) вернул {resp.status_code}: {body or resp.reason}",
+            )
+        try:
+            return resp.json()
+        except ValueError:
+            raise HTTPException(status_code=502, detail=f"RunPod ({label}) вернул ответ, который не удалось разобрать")
+    raise HTTPException(status_code=502, detail=f"RunPod ({label}) не принял запрос: слишком много запросов, попробуйте позже")
+
+
 LIPSYNC_PREFIX = "lipsync:"
 
 # Кейс 3 с текстом (TTS -> липсинк): раньше TTS-шаг выполнялся
@@ -179,13 +221,7 @@ def submit_sadtalker_job(image_path: str, audio_path: str, expression_scale: flo
         }
     }
 
-    try:
-        resp = requests.post(f"{RUNPOD_BASE_URL}/run", headers=HEADERS, json=payload, timeout=30)
-        resp.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Не удалось связаться с RunPod (SadTalker): {e}")
-
-    job = resp.json()
+    job = runpod_post(f"{RUNPOD_BASE_URL}/run", payload, "SadTalker")
     job_id = job.get("id")
     if not job_id:
         raise HTTPException(status_code=502, detail=f"RunPod не вернул id задачи: {job}")
@@ -210,13 +246,7 @@ def submit_photo_text_emotion_job(image_path: str, voice_sample_path: str, text:
         }
     }
 
-    try:
-        resp = requests.post(f"{RUNPOD_BASE_URL}/run", headers=HEADERS, json=payload, timeout=30)
-        resp.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Не удалось связаться с RunPod (SadTalker/XTTS): {e}")
-
-    job = resp.json()
+    job = runpod_post(f"{RUNPOD_BASE_URL}/run", payload, "SadTalker/XTTS")
     job_id = job.get("id")
     if not job_id:
         raise HTTPException(status_code=502, detail=f"RunPod не вернул id задачи: {job}")
@@ -243,13 +273,7 @@ def submit_lipsync_job(video_path: str, audio_path: str) -> str:
         }
     }
 
-    try:
-        resp = requests.post(f"{RUNPOD_LIPSYNC_BASE_URL}/run", headers=HEADERS, json=payload, timeout=30)
-        resp.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Не удалось связаться с RunPod (lipsync): {e}")
-
-    job = resp.json()
+    job = runpod_post(f"{RUNPOD_LIPSYNC_BASE_URL}/run", payload, "lipsync")
     raw_job_id = job.get("id")
     if not raw_job_id:
         raise HTTPException(status_code=502, detail=f"RunPod (lipsync) не вернул id задачи: {job}")
@@ -281,13 +305,7 @@ def submit_echomimic_job(image_path: str, audio_path: str, emotion: Optional[str
     if emotion:
         payload_input["emotion"] = emotion
 
-    try:
-        resp = requests.post(f"{RUNPOD_ECHOMIMIC_BASE_URL}/run", headers=HEADERS, json={"input": payload_input}, timeout=30)
-        resp.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Не удалось связаться с RunPod (EchoMimic): {e}")
-
-    job = resp.json()
+    job = runpod_post(f"{RUNPOD_ECHOMIMIC_BASE_URL}/run", {"input": payload_input}, "EchoMimic")
     raw_job_id = job.get("id")
     if not raw_job_id:
         raise HTTPException(status_code=502, detail=f"RunPod (EchoMimic) не вернул id задачи: {job}")
@@ -318,17 +336,11 @@ def submit_longcat_job(image_path: str, audio_path: str, emotion: Optional[str] 
     if emotion:
         payload_input["emotion"] = emotion
 
-    try:
-        resp = requests.post(
-            f"{RUNPOD_LONGCAT_BASE_URL}/run", headers=HEADERS,
-            json={"input": payload_input, "policy": {"ttl": LONGCAT_JOB_TTL_SECONDS * 1000}},
-            timeout=30,
-        )
-        resp.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Не удалось связаться с RunPod (LongCat): {e}")
-
-    job = resp.json()
+    job = runpod_post(
+        f"{RUNPOD_LONGCAT_BASE_URL}/run",
+        {"input": payload_input, "policy": {"ttl": LONGCAT_JOB_TTL_SECONDS * 1000}},
+        "LongCat",
+    )
     raw_job_id = job.get("id")
     if not raw_job_id:
         raise HTTPException(status_code=502, detail=f"RunPod (LongCat) не вернул id задачи: {job}")
@@ -345,7 +357,15 @@ def poll_runpod_job_sync(base_url: str, job_id: str, timeout: float = 120, inter
     deadline = time.time() + timeout
     while time.time() < deadline:
         resp = requests.get(f"{base_url}/status/{job_id}", headers=HEADERS, timeout=20)
-        resp.raise_for_status()
+        if resp.status_code == 429:
+            # лимит запросов: просто ждём дольше и спрашиваем снова
+            time.sleep(interval * 2)
+            continue
+        if resp.status_code >= 400:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Озвучка текста: RunPod вернул {resp.status_code}: {_rp_detail(resp) or resp.reason}",
+            )
         data = resp.json()
         status = data.get("status")
         if status == "COMPLETED":
@@ -368,13 +388,7 @@ def synthesize_tts_via_runpod(voice_sample_path: str, text: str, language: str, 
             "language": language,
         }
     }
-    try:
-        resp = requests.post(f"{RUNPOD_BASE_URL}/run", headers=HEADERS, json=payload, timeout=30)
-        resp.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Не удалось запустить озвучку текста: {e}")
-
-    job = resp.json()
+    job = runpod_post(f"{RUNPOD_BASE_URL}/run", payload, "озвучка текста")
     job_id = job.get("id")
     if not job_id:
         raise HTTPException(status_code=502, detail=f"RunPod не вернул id задачи озвучки: {job}")
@@ -654,17 +668,12 @@ def submit_tts_job(text: str, language: str, voice_style: str, speech_tempo: str
     else:
         inp["speaker"] = speaker
 
-    try:
-        resp = requests.post(
-            f"{RUNPOD_BASE_URL}/run", headers=HEADERS,
-            json={"input": inp, "policy": {"ttl": TTS_JOB_TTL_SECONDS * 1000}},
-            timeout=30,
-        )
-        resp.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Не удалось связаться с RunPod (озвучка): {e}")
-
-    job_id = resp.json().get("id")
+    job = runpod_post(
+        f"{RUNPOD_BASE_URL}/run",
+        {"input": inp, "policy": {"ttl": TTS_JOB_TTL_SECONDS * 1000}},
+        "озвучка",
+    )
+    job_id = job.get("id")
     if not job_id:
         raise HTTPException(status_code=502, detail="RunPod не вернул id задачи озвучки")
     return job_id
@@ -743,6 +752,11 @@ async def get_tts_status(
     if resp.status_code == 404:
         TTS_JOBS.pop(job_id, None)
         raise HTTPException(status_code=504, detail="Время ожидания озвучки истекло. Деньги не списаны, попробуйте ещё раз.")
+    if resp.status_code in (401, 403):
+        raise HTTPException(status_code=502, detail="Сервер не смог обратиться к RunPod: ключ доступа отклонён. Деньги не списаны.")
+    if resp.status_code == 429 or resp.status_code >= 500:
+        # временная ошибка RunPod или лимит запросов: просто ждём следующего опроса
+        return {"job_id": job_id, "status": "IN_PROGRESS"}
 
     data = resp.json()
     status = data.get("status")
@@ -850,6 +864,14 @@ async def get_job_status(job_id: str, db: Session = Depends(get_db)):
             status_code=504,
             detail="Время ожидания задачи истекло. Деньги за неё не списаны — попробуйте ещё раз."
         )
+    if status_resp.status_code in (401, 403):
+        raise HTTPException(
+            status_code=502,
+            detail="Сервер не смог обратиться к RunPod: ключ доступа отклонён. Деньги за задачу не списаны."
+        )
+    if status_resp.status_code == 429 or status_resp.status_code >= 500:
+        # временная ошибка RunPod или лимит запросов: не роняем задачу, клиент спросит ещё раз
+        return {"job_id": job_id, "status": "IN_PROGRESS"}
 
     data = status_resp.json()
     status = data.get("status")
