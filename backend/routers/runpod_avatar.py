@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from database import get_db
 from auth_utils import get_current_user_id
 from routers.billing import calculate_generation_cost, get_or_create_user, charge_user as charge_feature
+from video_fit import fit_video_for_runpod
 
 load_dotenv()
 
@@ -50,6 +51,13 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 MAX_CLIP_SECONDS = 15  # то же ограничение, что и во фронтенде (api.js)
+
+# Видео для липсинка, которое пользователь может загрузить: дальше оно сжимается под лимит RunPod
+# (см. video_fit.py). Больше этого сервер не принимает, чтобы не забивать память.
+MAX_VIDEO_UPLOAD_MB = int(os.getenv("MAX_VIDEO_UPLOAD_MB", "60"))
+MAX_VIDEO_UPLOAD_BYTES = MAX_VIDEO_UPLOAD_MB * 1024 * 1024
+# Тело запроса /run в RunPod не может быть больше 10 МиБ.
+RUNPOD_MAX_BODY_BYTES = 10 * 1024 * 1024
 
 router = APIRouter(prefix="/api/generate", tags=["avatar-generation"])
 
@@ -175,6 +183,15 @@ def get_media_duration_seconds(path: str) -> float:
     return float(media.info.length)
 
 
+def _check_video_size(data: bytes):
+    """Отсекает слишком большие загрузки видео сразу, не доходя до ffmpeg и RunPod."""
+    if len(data) > MAX_VIDEO_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Видео больше {MAX_VIDEO_UPLOAD_MB} МБ. Сократите ролик до 10–15 секунд и попробуйте снова.",
+        )
+
+
 def charge_user(db: Session, user_id: str, cost: float):
     if user_id in UNLIMITED_USER_IDS:
         return
@@ -261,10 +278,23 @@ def submit_lipsync_job(video_path: str, audio_path: str) -> str:
             detail="RUNPOD_LIPSYNC_ENDPOINT_ID не задан на сервере — проверь переменные окружения Railway"
         )
 
-    with open(video_path, "rb") as f:
-        video_b64 = base64.b64encode(f.read()).decode("utf-8")
+    # Тело запроса в RunPod не больше 10 МиБ: если видео вместе со звуком не помещается,
+    # оно сжимается (см. video_fit.py). Если видео уже влезает или уже сжато, вернётся тот же путь.
+    send_path = fit_video_for_runpod(video_path, audio_path)
+    try:
+        with open(send_path, "rb") as f:
+            video_b64 = base64.b64encode(f.read()).decode("utf-8")
+    finally:
+        if send_path != video_path and os.path.exists(send_path):
+            os.remove(send_path)
     with open(audio_path, "rb") as f:
         audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    if len(video_b64) + len(audio_b64) + 512 > RUNPOD_MAX_BODY_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="Видео и озвучка вместе слишком большие для обработки. Сократите ролик или текст.",
+        )
 
     payload = {
         "input": {
@@ -412,7 +442,8 @@ async def _run_lipsync_from_text_job(internal_id: str, video_path: str, voice_pa
     полностью вне HTTP-запроса. Регистрирует результат в JOB_OWNERS
     (тот же механизм отложенного списания, что уже используется в
     Кейсе 1) — списание произойдёт при получении готового видео в
-    get_job_status, как обычно."""
+    get_job_status, как обычно. Сжатие видео под лимит RunPod происходит
+    внутри submit_lipsync_job (до отправки)."""
     try:
         audio_path, duration = await asyncio.to_thread(
             synthesize_tts_via_runpod, voice_path, text, language, work_dir
@@ -579,24 +610,32 @@ async def generate_lipsync(
     user_id: str = Depends(get_current_user_id),
     db: Session = Depends(get_db),
 ):
+    video_data = await video.read()
+    audio_data = await audio.read()
+    _check_video_size(video_data)
+
     request_id = uuid.uuid4().hex
     video_path = os.path.join(TEMP_DIR, f"{request_id}_{video.filename}")
     audio_path = os.path.join(TEMP_DIR, f"{request_id}_{audio.filename}")
 
     with open(video_path, "wb") as f:
-        f.write(await video.read())
+        f.write(video_data)
     with open(audio_path, "wb") as f:
-        f.write(await audio.read())
+        f.write(audio_data)
 
+    fitted = None
     try:
         duration = get_media_duration_seconds(audio_path)
         cost = calculate_generation_cost(duration)
+        # Сначала сжимаем видео под лимит RunPod (если нужно): если сжатие не удастся,
+        # деньги ещё не списаны.
+        fitted = await asyncio.to_thread(fit_video_for_runpod, video_path, audio_path)
         charge_user(db, user_id, cost)
 
-        job_id = await asyncio.to_thread(submit_lipsync_job, video_path, audio_path)
+        job_id = await asyncio.to_thread(submit_lipsync_job, fitted, audio_path)
     finally:
-        for p in (video_path, audio_path):
-            if os.path.exists(p):
+        for p in (video_path, audio_path, fitted):
+            if p and os.path.exists(p):
                 os.remove(p)
 
     return {"job_id": job_id, "status_url": f"/api/generate/status/{job_id}"}
@@ -629,7 +668,13 @@ async def generate_lipsync_from_text(
     возвращается за доли секунды с временным job_id (префикс
     textlipsync:). Списание баланса теперь ОТЛОЖЕНО до готового видео
     (тот же механизм JOB_OWNERS, что уже в Кейсе 1) — раньше
-    списывалось сразу после TTS-шага, ДО завершения HTTP-запроса."""
+    списывалось сразу после TTS-шага, ДО завершения HTTP-запроса.
+    Видео, которое не помещается в лимит RunPod, сжимается в фоне
+    перед отправкой (см. submit_lipsync_job и video_fit.py)."""
+    video_data = await video.read()
+    voice_data = await voice_sample.read()
+    _check_video_size(video_data)
+
     request_id = uuid.uuid4().hex
     work_dir = os.path.join(TEMP_DIR, request_id)
     os.makedirs(work_dir, exist_ok=True)
@@ -637,9 +682,9 @@ async def generate_lipsync_from_text(
     voice_path = os.path.join(work_dir, f"voice_{voice_sample.filename}")
 
     with open(video_path, "wb") as f:
-        f.write(await video.read())
+        f.write(video_data)
     with open(voice_path, "wb") as f:
-        f.write(await voice_sample.read())
+        f.write(voice_data)
 
     internal_id = uuid.uuid4().hex
     TEXT_LIPSYNC_JOBS[internal_id] = {"status": "PENDING", "runpod_job_id": None, "error": None}
