@@ -13,8 +13,9 @@ Avatar Studio — модуль биллинга.
   MAX со ссылкой на подтверждение в один клик, без Swagger/curl;
 - списание с баланса за генерацию (посекундно, +50% наценка к стоимости
   GPU-времени RunPod);
-- единый баланс для Video Studio: журнал списаний, история операций и
-  подписка Video Studio (199 ₽ в месяц, оплата с общего баланса);
+- единый баланс для Video Studio и SmartBestMemo: журнал списаний, история
+  операций и подписки (Video Studio 199 ₽ и SmartBestMemo 2990 ₽ в месяц,
+  оплата с общего баланса);
 - информационные уведомления админу: подписка оформлена/продлена,
   пополнение через Crypto Pay зачислено.
 
@@ -767,63 +768,104 @@ async def billing_history(db: Session = Depends(get_db), user_id: str = Depends(
     return {"items": items[:30]}
 
 
-# ---------- Подписка Video Studio: 199 ₽ / 30 дней, оплата с общего баланса ----------
+# ---------- Подписки с общего баланса: Video Studio 199 ₽ и SmartBestMemo 2990 ₽, по 30 дней ----------
 
 VIDEO_SUB_PRODUCT = "video-studio"
 VIDEO_SUB_PRICE_RUB = 199.0
 VIDEO_SUB_DAYS = 30
 
+# Подписки продуктов: название (для уведомлений), цена в рублях и срок.
+# Продукт передаётся параметром ?product=...; без параметра это Video Studio
+# (так работает фронтенд Video Studio, его менять не нужно).
+SUB_PRODUCTS = {
+    "video-studio": {"title": "Video Studio", "price_rub": VIDEO_SUB_PRICE_RUB, "days": VIDEO_SUB_DAYS},
+    "smart-memo": {"title": "SmartBestMemo", "price_rub": 2990.0, "days": 30},
+}
+
+
+def sub_config(product: str) -> dict:
+    cfg = SUB_PRODUCTS.get(product)
+    if not cfg:
+        raise HTTPException(status_code=400, detail="Неизвестный продукт подписки")
+    return cfg
+
+
+def sub_price_usd(price_rub: float) -> float:
+    """Цена подписки в USD по тому же курсу, что и рублёвые пополнения.
+    Округление ВНИЗ до 4 знаков: пополнение ровно на цену подписки в рублях
+    (по СБП или через Crypto Pay в RUB) зачисляется как price_rub * RUB_TO_USD_RATE
+    и всегда покрывает цену подписки без копеечной недостачи."""
+    return math.floor(price_rub * RUB_TO_USD_RATE * 10000) / 10000
+
 
 def video_sub_price_usd() -> float:
-    """Цена подписки в USD по тому же курсу, что и рублёвые пополнения.
-    Округление ВНИЗ до 4 знаков: пополнение ровно на 199 ₽ (по СБП или
-    через Crypto Pay в RUB) зачисляется как 199 * RUB_TO_USD_RATE и
-    всегда покрывает цену подписки без копеечной недостачи."""
-    return math.floor(VIDEO_SUB_PRICE_RUB * RUB_TO_USD_RATE * 10000) / 10000
+    return sub_price_usd(VIDEO_SUB_PRICE_RUB)
 
 
-def _sub_payload(sub) -> dict:
+def _sub_payload(sub, product: str = VIDEO_SUB_PRODUCT) -> dict:
+    cfg = sub_config(product)
     now = datetime.utcnow()
     active = bool(sub and sub.until and sub.until > now)
     return {
+        "product": product,
         "active": active,
         "until": (sub.until.isoformat() + "Z") if sub and sub.until else None,
-        "price_rub": VIDEO_SUB_PRICE_RUB,
-        "price_usd": video_sub_price_usd(),
-        "days": VIDEO_SUB_DAYS,
+        "price_rub": cfg["price_rub"],
+        "price_usd": sub_price_usd(cfg["price_rub"]),
+        "days": cfg["days"],
     }
 
 
-def subscription_info_text(user_id: str, renewed: bool, until: datetime, price_usd: float, balance_usd: float) -> str:
-    """Текст информационного сообщения о подписке Video Studio."""
+def subscription_info_text(
+    user_id: str,
+    renewed: bool,
+    until: datetime,
+    price_usd: float,
+    balance_usd: float,
+    product: str = VIDEO_SUB_PRODUCT,
+) -> str:
+    """Текст информационного сообщения о подписке."""
+    cfg = sub_config(product)
     return (
-        "\U0001F514 Подписка Video Studio " + ("продлена" if renewed else "оформлена") + "\n"
+        f"\U0001F514 Подписка {cfg['title']} " + ("продлена" if renewed else "оформлена") + "\n"
         f"Клиент: {user_id}\n"
-        f"Списано: {VIDEO_SUB_PRICE_RUB:.0f} \u20bd (${price_usd:.2f}) с баланса\n"
+        f"Списано: {cfg['price_rub']:.0f} \u20bd (${price_usd:.2f}) с баланса\n"
         f"Действует до: {until:%d.%m.%Y %H:%M} UTC\n"
         f"Остаток баланса: ${balance_usd:.2f}"
     )
 
 
 @router.get("/subscription")
-async def get_subscription(db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
-    """Статус подписки Video Studio у текущего пользователя + цена."""
+async def get_subscription(
+    product: str = VIDEO_SUB_PRODUCT,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Статус подписки (по умолчанию Video Studio; ?product=smart-memo для
+    SmartBestMemo) у текущего пользователя + цена."""
+    sub_config(product)
     sub = db.query(Subscription).filter(
         Subscription.user_id == user_id,
-        Subscription.product == VIDEO_SUB_PRODUCT,
+        Subscription.product == product,
     ).first()
-    return _sub_payload(sub)
+    return _sub_payload(sub, product)
 
 
 @router.post("/subscribe")
-async def subscribe_video(db: Session = Depends(get_db), user_id: str = Depends(get_current_user_id)):
-    """Покупка/продление подписки Video Studio с общего баланса.
+async def subscribe_video(
+    product: str = VIDEO_SUB_PRODUCT,
+    db: Session = Depends(get_db),
+    user_id: str = Depends(get_current_user_id),
+):
+    """Покупка/продление подписки с общего баланса (по умолчанию Video
+    Studio; ?product=smart-memo для SmartBestMemo).
     Списание, запись в журнал и продление подписки — в ОДНОЙ транзакции:
     либо всё, либо ничего. Цену считает сервер, клиент её не передаёт.
-    Если подписка ещё действует, +30 дней добавляются к её концу.
+    Если подписка ещё действует, срок добавляется к её концу.
     После успешной покупки админу уходит информационное сообщение
     (Telegram и/или MAX), в фоне, чтобы не задерживать ответ клиенту."""
-    price = video_sub_price_usd()
+    cfg = sub_config(product)
+    price = sub_price_usd(cfg["price_rub"])
     now = datetime.utcnow()
 
     user = db.query(User).filter(User.user_id == user_id).with_for_update().first()
@@ -834,6 +876,7 @@ async def subscribe_video(db: Session = Depends(get_db), user_id: str = Depends(
     # защита от двойного клика: вторая покупка в течение 15 секунд отклоняется
     recent = db.query(Charge).filter(
         Charge.user_id == user_id,
+        Charge.product == product,
         Charge.feature == "subscription",
         Charge.created_at > now - timedelta(seconds=15),
     ).first()
@@ -843,33 +886,33 @@ async def subscribe_video(db: Session = Depends(get_db), user_id: str = Depends(
 
     sub = db.query(Subscription).filter(
         Subscription.user_id == user_id,
-        Subscription.product == VIDEO_SUB_PRODUCT,
+        Subscription.product == product,
     ).with_for_update().first()
     was_active = bool(sub and sub.until and sub.until > now)
     start = sub.until if was_active else now
-    until = start + timedelta(days=VIDEO_SUB_DAYS)
+    until = start + timedelta(days=cfg["days"])
     if sub:
         sub.until = until
     else:
-        sub = Subscription(user_id=user_id, product=VIDEO_SUB_PRODUCT, until=until)
+        sub = Subscription(user_id=user_id, product=product, until=until)
         db.add(sub)
 
     user.balance_usd -= price
     db.add(Charge(
         user_id=user_id,
-        product=VIDEO_SUB_PRODUCT,
+        product=product,
         feature="subscription",
         amount_usd=price,
-        units=VIDEO_SUB_DAYS,
-        note=f"{VIDEO_SUB_PRICE_RUB:.0f} ₽ / {VIDEO_SUB_DAYS} дн.",
+        units=cfg["days"],
+        note=f"{cfg['price_rub']:.0f} ₽ / {cfg['days']} дн.",
     ))
     db.commit()
 
-    payload = _sub_payload(sub)
+    payload = _sub_payload(sub, product)
     payload["balance_usd"] = round(user.balance_usd, 4)
 
     _fire_and_forget(
         notify_info,
-        subscription_info_text(user_id, was_active, until, price, payload["balance_usd"]),
+        subscription_info_text(user_id, was_active, until, price, payload["balance_usd"], product),
     )
     return payload
